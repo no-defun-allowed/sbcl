@@ -1904,7 +1904,7 @@
                  (%def-inst-encoder ',fun-name nil ',accept-prefixes))
                (%def-inst-encoder
                 ',fun-name
-                (named-lambda ,(string fun-name) (,segment-name ,@operands)
+                (named-lambda (:assemble ,(string fun-name)) (,segment-name ,@operands)
                   (declare ,@decls)
                   (let ,(and vop-name `((,vop-name **current-vop**)))
                     (block ,fun-name ,@emitter)))

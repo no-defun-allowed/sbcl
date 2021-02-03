@@ -2943,10 +2943,10 @@
          (setq dst (sized-thing dst size)
                src (sized-thing src size))
          (cond ((xmm-register-p dst)
-                (emit-sse-inst segment dst src #x66 #x6e))
+                (emit-sse-inst segment dst src #x66 #x6e :operand-size :do-not-set))
                (t
                 (aver (xmm-register-p src))
-                (emit-sse-inst segment src dst #x66 #x7e)))))
+                (emit-sse-inst segment src dst #x66 #x7e :operand-size :do-not-set)))))
   (define-instruction movd (segment dst src)
     (:emitter (move-xmm<->gpr segment dst src :dword))
     . #.(append (sse-inst-printer-list 'xmm-reg/mem #x66 #x6e
@@ -3208,7 +3208,7 @@
                     :printer '(:name :tab reg ", " reg/mem ", XMM0"))
                 (:emitter
                  (aver (xmm-register-p dst))
-                 (aver (and (xmm-register-p mask) (= (tn-offset mask) 0)))
+                 (aver (xmm-register-p mask))
                  (emit-regular-2byte-sse-inst segment dst src ,prefix
                                               ,op1 ,op2)))))
 
@@ -3262,6 +3262,7 @@
 
 (flet ((emit* (segment ea subcode)
          (aver (not (register-p ea)))
+         #+(or)
          (aver (eq (operand-size ea) :dword))
          (emit-prefixes segment ea nil :dword)
          (emit-bytes segment #x0f #xae)
