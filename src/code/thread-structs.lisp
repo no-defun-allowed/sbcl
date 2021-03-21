@@ -25,10 +25,8 @@
 ;;; in genesis can properly emulate MAKE-MUTEX for the altered structure,
 ;;; or even better, make sure that genesis can emulate any constructor,
 ;;; provided that it is sufficiently trivial.
-(sb-xc:defstruct (mutex (:constructor make-mutex
-                            (&key name
-                             &aux (counter (unless (null name)
-                                             (find-counter name)))))
+
+(sb-xc:defstruct (mutex (:constructor make-mutex (&key name counter))
                         (:copier nil))
   "Mutex type."
   #+sb-futex (state 0 :type sb-vm:word)
@@ -36,8 +34,7 @@
   ;; which attempts to divine a string from a futex word address.
   (name   nil :type (or null simple-string))
   (%owner nil :type (or null thread))
-  #+sb-record-mutex-misses
-  (counter nil :type (or null t)))
+  (counter nil :read-only t))
 
 (sb-xc:defstruct (waitqueue (:copier nil) (:constructor make-waitqueue (&key name)))
   "Waitqueue type."

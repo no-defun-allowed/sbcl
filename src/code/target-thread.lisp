@@ -716,21 +716,30 @@ returns NIL each time."
       t))
    #-sb-futex
    (t
-    (flet ((cas ()
-           (loop repeat 100
-                 when (and (progn
-                             (barrier (:read))
-                             (not (mutex-%owner mutex)))
-                           (not (sb-ext:compare-and-swap (mutex-%owner mutex) nil
-                                                         new-owner)))
-                 do (return-from cas t)
-                 else
-                 do
-                    (sb-ext:spin-loop-hint))
-           ;; Check for pending interrupts.
-           (with-interrupts nil)))
-      (declare (dynamic-extent #'cas))
-      (%%wait-for #'cas stop-sec stop-usec)))))
+    (let ((written? nil))
+      (flet ((cas ()
+               (loop repeat 100
+                     when (and (progn
+                                 (barrier (:read))
+                                 (not (mutex-%owner mutex)))
+                               (not (sb-ext:compare-and-swap (mutex-%owner mutex) nil
+                                                             new-owner)))
+                       do (return-from cas t)
+                     else
+                       do
+                          (sb-ext:spin-loop-hint))
+               (unless written?
+                 (setf written? t)
+                 (let ((counter (mutex-counter mutex)))
+                   (when (arrayp counter)
+                     (locally
+                         (declare ((simple-array sb-ext:word (1)) counter)
+                                  (optimize (speed 3) (safety 0)))
+                       (sb-ext:atomic-incf (aref counter 0))))))
+               ;; Check for pending interrupts.
+               (with-interrupts nil)))
+        (declare (dynamic-extent #'cas))
+        (%%wait-for #'cas stop-sec stop-usec))))))
 
 #+sb-thread
 (defun %wait-for-mutex (mutex self timeout to-sec to-usec stop-sec stop-usec deadlinep)

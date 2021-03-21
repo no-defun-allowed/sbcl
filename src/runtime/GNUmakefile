@@ -33,7 +33,7 @@ __LDFLAGS__ =
 
 include ../../output/prefix.def
 
-CFLAGS += -g -Wall -Wundef -Wsign-compare -Wpointer-arith -O3
+CFLAGS += -g -Wall -Wundef -Wsign-compare -Wpointer-arith -O3 -march=native -mtune=native
 ASFLAGS += $(CFLAGS)
 CPPFLAGS += -I.
 
