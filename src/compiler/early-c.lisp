@@ -40,18 +40,6 @@
 
 ;;;; miscellaneous types used both in the cross-compiler and on the target
 
-;;;; FIXME: The INDEX and LAYOUT-DEPTHOID definitions probably belong
-;;;; somewhere else, not "early-c", since they're after all not part
-;;;; of the compiler.
-
-;;; the type of LAYOUT-DEPTHOID and LAYOUT-LENGTH values.
-;;; Each occupies two bytes of the %BITS slot when possible,
-;;; otherwise a slot unto itself.
-(def!type layout-depthoid () '(integer -1 #x7FFF))
-(def!type layout-length () '(integer 0 #xFFFF))
-(def!type layout-bitmap () 'integer)
-;;; ID must be an fixnum for either value of n-word-bits.
-(def!type layout-id () '(signed-byte 30))
 
 ;;; An INLINEP value describes how a function is called. The values
 ;;; have these meanings:
@@ -126,7 +114,6 @@
 (defvar *constraint-universe*)
 (defvar *current-path*)
 (defvar *current-component*)
-(defvar *delayed-ir1-transforms*)
 #+sb-dyncount
 (defvar *dynamic-counts-tn*)
 (defvar *elsewhere-label*)
@@ -140,6 +127,9 @@
 (defvar *lambda-conversions*)
 (defvar *compile-object* nil)
 (defvar *location-context* nil)
+
+(defvar *handled-conditions* nil)
+(defvar *disabled-package-locks* nil)
 
 (defvar *stack-allocate-dynamic-extent* t
   "If true (the default), the compiler respects DYNAMIC-EXTENT declarations
@@ -195,47 +185,6 @@ the stack without triggering overflow protection.")
   ;; *UNDEFINED-WARNING-LIMIT* calls.
   (warnings () :type list))
 (declaim (freeze-type undefined-warning))
-
-;;; Delete any undefined warnings for NAME and KIND. This is for the
-;;; benefit of the compiler, but it's sometimes called from stuff like
-;;; type-defining code which isn't logically part of the compiler.
-(declaim (ftype (function ((or symbol cons) keyword) (values))
-                note-name-defined))
-(defun note-name-defined (name kind)
-  #-sb-xc-host (atomic-incf *type-cache-nonce*)
-  ;; We do this BOUNDP check because this function can be called when
-  ;; not in a compilation unit (as when loading top level forms).
-  (when (boundp '*undefined-warnings*)
-    (let ((name (uncross name)))
-      (setq *undefined-warnings*
-            (delete-if (lambda (x)
-                         (and (equal (undefined-warning-name x) name)
-                              (eq (undefined-warning-kind x) kind)))
-                       *undefined-warnings*))))
-  (values))
-
-;;; to be called when a variable is lexically bound
-(declaim (ftype (function (symbol) (values)) note-lexical-binding))
-(defun note-lexical-binding (symbol)
-    ;; This check is intended to protect us from getting silently
-    ;; burned when we define
-    ;;   foo.lisp:
-    ;;     (DEFVAR *FOO* -3)
-    ;;     (DEFUN FOO (X) (+ X *FOO*))
-    ;;   bar.lisp:
-    ;;     (DEFUN BAR (X)
-    ;;       (LET ((*FOO* X))
-    ;;         (FOO 14)))
-    ;; and then we happen to compile bar.lisp before foo.lisp.
-  (when (looks-like-name-of-special-var-p symbol)
-    ;; FIXME: should be COMPILER-STYLE-WARNING?
-    (style-warn 'asterisks-around-lexical-variable-name
-                :format-control
-                "using the lexical binding of the symbol ~
-                 ~/sb-ext:print-symbol-with-prefix/, not the~@
-                 dynamic binding"
-                :format-arguments (list symbol)))
-  (values))
 
 ;;; This is DEF!STRUCT so that when SB-C:DUMPABLE-LEAFLIKE-P invokes
 ;;; SB-XC:TYPEP in make-host-2, it does not need need to signal PARSE-UNKNOWN

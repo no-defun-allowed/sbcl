@@ -244,7 +244,7 @@
        ,n-x)))
 
 (deftransform last ((list &optional n) (t &optional t))
-  (let ((c (constant-lvar-p n)))
+  (let ((c (and n (constant-lvar-p n))))
     (cond ((or (not n)
                (and c (eql 1 (lvar-value n))))
            '(%last1 list))
@@ -3818,7 +3818,7 @@
           (t
            (do* ((i (1- nargs) (1- i))
                  (last nil current)
-                 (current (gensym) (gensym))
+                 (current (sb-xc:gensym) (sb-xc:gensym))
                  (vars (list current) (cons current vars))
                  (result t (if not-p
                                `(if (,predicate ,current ,last)
@@ -4393,7 +4393,8 @@
 (deftransform %rest-ref ((n list context count &optional length-checked-p))
   (cond ((not (rest-var-more-context-ok list))
          `(nth n list))
-        ((and (constant-lvar-p length-checked-p)
+        ((and length-checked-p
+              (constant-lvar-p length-checked-p)
               (lvar-value length-checked-p))
          `(%more-arg context n))
         (t

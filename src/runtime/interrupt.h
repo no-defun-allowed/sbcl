@@ -18,8 +18,6 @@
 
 extern void sigset_tostring(const sigset_t *sigset, char* result, int result_length);
 
-/* Set all deferrable signals into *s. */
-extern void sigaddset_deferrable(sigset_t *s);
 /* Set all blockable signals into *s. */
 extern void sigaddset_blockable(sigset_t *s);
 
@@ -139,7 +137,7 @@ extern void lower_thread_control_stack_guard_page(struct thread *th);
 extern void reset_thread_control_stack_guard_page(struct thread *th);
 
 #if defined(LISP_FEATURE_SB_SAFEPOINT) && !defined(LISP_FEATURE_WIN32)
-# ifdef LISP_FEATURE_SB_THRUPTION
+# ifdef LISP_FEATURE_SB_SAFEPOINT
 void thruption_handler(int signal, siginfo_t *info, os_context_t *context);
 # endif
 #endif

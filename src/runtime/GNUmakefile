@@ -33,7 +33,7 @@ __LDFLAGS__ =
 
 include ../../output/prefix.def
 
-CFLAGS += -g -Wall -Wundef -Wsign-compare -Wpointer-arith -O3
+CFLAGS += -g -Wall -Wundef -Wsign-compare -Wpointer-arith -O3 -march=native -mtune=native
 ASFLAGS += $(CFLAGS)
 CPPFLAGS += -I.
 
@@ -75,11 +75,11 @@ COMMON_SRC = alloc.c backtrace.c breakpoint.c coalesce.c coreparse.c    \
 	interr.c interrupt.c largefile.c main.c                         \
 	monitor.c murmur_hash.c os-common.c parse.c print.c             \
 	purify.c regnames.c runtime.c			                \
-	safepoint.c save.c sc-offset.c search.c thread.c time.c         \
+	safepoint.c save.c sc-offset.c search.c thread.c time.c \
 	validate.c var-io.c vars.c wrap.c
 
 ifndef LISP_FEATURE_WIN32
-COMMON_SRC += run-program.c
+COMMON_SRC += run-program.c sprof.c
 endif
 
 C_SRC = $(COMMON_SRC) ${ARCH_SRC} ${OS_SRC} ${GC_SRC}

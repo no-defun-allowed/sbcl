@@ -28,6 +28,7 @@
 #include <stdio.h>
 #include <signal.h>
 #include <string.h>
+#include <immintrin.h>
 #include "sbcl.h"
 #include "runtime.h"
 #include "os.h"
@@ -198,9 +199,29 @@ void heap_scavenge(lispobj *start, lispobj *end)
 sword_t scavenge(lispobj *start, sword_t n_words)
 {
     gc_dcheck(compacting_p());
+    // Scavenge the first part quickly.
+    __m256i *pstart = (__m256i*)start;
+    __m256i *pend   = pstart + (n_words >> 2);
+    __m256i *pobjects;
+    __m256i threes  = _mm256_set1_epi64x(3ULL);
+    for (pobjects = pstart; pobjects < pend; pobjects++) {
+      __m256i objects = _mm256_loadu_si256(pobjects);
+      __m256i tags    = _mm256_and_si256(objects, threes);
+      __m256i lisp_pointer_mask = _mm256_cmpeq_epi64(tags, threes);
+      unsigned int mask = _mm256_movemask_epi8(lisp_pointer_mask);
+      if (mask) {
+        lispobj *first_object = (lispobj*)pobjects;
+        if (mask & 1 << 0)  scav1(first_object + 0, *(first_object + 0));
+        if (mask & 1 << 8)  scav1(first_object + 1, *(first_object + 1));
+        if (mask & 1 << 16) scav1(first_object + 2, *(first_object + 2));
+        if (mask & 1 << 24) scav1(first_object + 3, *(first_object + 3));
+      }
+    }
+    // Scavenge the left over bit.
+    lispobj *remainder = (lispobj*)pend;
     lispobj *end = start + n_words;
     lispobj *object_ptr;
-    for (object_ptr = start; object_ptr < end; object_ptr++) {
+    for (object_ptr = remainder; object_ptr < end; object_ptr++) {
         lispobj object = *object_ptr;
         if (is_lisp_pointer(object)) scav1(object_ptr, object);
     }
@@ -1841,7 +1862,7 @@ valid_lisp_pointer_p(lispobj pointer)
     return 0;
 }
 
-static boolean can_invoke_post_gc(struct thread* th,
+static boolean can_invoke_post_gc(__attribute__((unused)) struct thread* th,
                                   sigset_t *context_sigmask)
 {
 #ifdef LISP_FEATURE_SB_THREAD
@@ -1872,7 +1893,7 @@ boolean
 maybe_gc(os_context_t *context)
 {
     lispobj gc_happened;
-    __attribute__((unused)) struct thread *thread = arch_os_get_current_thread();
+    __attribute__((unused)) struct thread *thread = get_sb_vm_thread();
     boolean were_in_lisp = !foreign_function_call_active_p(thread);
 
     if (were_in_lisp) {
@@ -1901,7 +1922,7 @@ maybe_gc(os_context_t *context)
      * A kludgy alternative is to propagate the sigmask change to the
      * outer context.
      */
-#if !(defined(LISP_FEATURE_WIN32) || defined(LISP_FEATURE_SB_SAFEPOINT))
+#ifndef LISP_FEATURE_SB_SAFEPOINT
     check_gc_signals_unblocked_or_lose(os_context_sigmask_addr(context));
     unblock_gc_signals();
 #endif
@@ -2007,7 +2028,7 @@ maybe_gc(os_context_t *context)
 void
 scrub_control_stack()
 {
-    scrub_thread_control_stack(arch_os_get_current_thread());
+    scrub_thread_control_stack(get_sb_vm_thread());
 }
 
 void

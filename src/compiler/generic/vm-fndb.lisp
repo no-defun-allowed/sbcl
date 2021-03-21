@@ -201,8 +201,12 @@
   (foldable flushable))
 (defknown %set-instance-layout (instance layout) layout
   ())
-(defknown %set-funcallable-instance-layout (funcallable-instance layout) layout
+(defknown %set-fun-layout (funcallable-instance layout) layout
   ())
+;;; Layout getter that accepts any object, and if it has INSTANCE- or FUN-
+;;; POINTER-LOWTAG returns the layout, otherwise some agreed-upon layout.
+(defknown %instanceoid-layout (t) layout (flushable))
+(defknown layout-eq ((or instance function) t (mod 16)) boolean (flushable))
 ;;; Caution: This is not exactly the same as instance_length() in C.
 ;;; The C one is the same as SB-VM::INSTANCE-LENGTH.
 (defknown %instance-length (instance) (unsigned-byte 14) (foldable flushable))

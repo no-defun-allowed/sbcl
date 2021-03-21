@@ -54,6 +54,25 @@
              :format-control
              "Not enough room left in static space to allocate vector.")))
 
+#+darwin-jit
+(defun allocate-static-code-vector (widetag length words)
+  (declare (type (unsigned-byte #.n-widetag-bits) widetag)
+           (type word words)
+           (type index length))
+  (or (with-system-mutex (*allocator-mutex*)
+        (let* ((pointer *static-code-space-free-pointer*)
+               (nbytes (pad-data-block (+ words vector-data-offset)))
+               (new-pointer (sap+ pointer nbytes)))
+          (when (sap<= new-pointer (int-sap static-code-space-end))
+            (setf (sap-ref-word-jit pointer (ash vector-length-slot word-shift))
+                  (fixnumize length))
+            (setf (sap-ref-word-jit pointer 0) widetag)
+            (setf *static-code-space-free-pointer* new-pointer)
+            (%make-lisp-obj (logior (sap-int pointer) other-pointer-lowtag)))))
+      (error 'simple-storage-condition
+             :format-control
+             "Not enough room left in static code space to allocate vector.")))
+
 #+immobile-space
 (progn
 
@@ -394,13 +413,14 @@
             (#.symbol-widetag 1)
             (#.fdefn-widetag  2)
             (#.instance-widetag
-             (cond ((<= aligned-nwords 16) (setq aligned-nwords 16) 3)
-                   ((<= aligned-nwords 24) (setq aligned-nwords 24) 4)
-                   ((<= aligned-nwords 32) (setq aligned-nwords 32) 5)
-                   ((<= aligned-nwords 48) (setq aligned-nwords 48) 6)
+             (cond ((<= aligned-nwords  8) (setq aligned-nwords  8) 3)
+                   ((<= aligned-nwords 16) (setq aligned-nwords 16) 4)
+                   ((<= aligned-nwords 24) (setq aligned-nwords 24) 5)
+                   ((<= aligned-nwords 32) (setq aligned-nwords 32) 6)
+                   ((<= aligned-nwords 48) (setq aligned-nwords 48) 7)
                    (t (error "Oversized layout"))))
             ;; TODO: allow different sizes of funcallable-instance
-            (#.funcallable-instance-widetag 7))))
+            (#.funcallable-instance-widetag 8))))
     (values (%primitive alloc-immobile-fixedobj
                         size-class
                         aligned-nwords
@@ -494,22 +514,30 @@
         ;; (Could dead immobile objects be converted to use FILLER-WIDETAG instead?)
         (unless (immobile-space-obj-p code)
           ;; Before writing the boxed word count, zeroize up to and including 1 word
-          ;; after the boxed header so that all point words can be safely read
-          ;; by GC and so the jump table count word is 0.
+          ;; after the boxed header so that all pointers can be safely read by GC,
+          ;; and so that the jump table count word is 0.
           (loop for byte-index from (ash boxed word-shift) downto (ash 2 word-shift)
                 by n-word-bytes
-                do (setf (sap-ref-word sap byte-index) 0)))
+                do (setf (sap-ref-word-jit sap byte-index) 0)))
         ;; The 1st slot beyond the header stores the boxed header size in bytes
         ;; as an untagged number, which has the same representation as a tagged
         ;; value denoting a word count if WORD-SHIFT = N-FIXNUM-TAG-BITS.
         ;; This boxed-size MUST be 0 prior to writing any pointers into the object
         ;; because the boxed words will not necessarily have been pre-zeroed;
         ;; scavenging them prior to zeroing them out would see wild pointers.
-        (setf (sap-ref-word sap (ash code-boxed-size-slot word-shift))
+        (setf (sap-ref-word-jit sap (ash code-boxed-size-slot word-shift))
               ;; For 32-bit words, we'll have to add another primitive-object slot.
               ;; But so far nothing makes use of the n-named-calls value.
               (logior #+64-bit (ash n-named-calls 32)
                       (ash boxed word-shift)))))
+
+    ;; FIXME: there may be random values in the unboxed payload and it's not obvious
+    ;; that all callers of ALLOCATE-CODE-OBJECT always write all raw bytes.
+    ;; LOAD-CODE and MAKE-CORE-COMPONENT certainly do because the representation
+    ;; of simple-funs requires that the final 2 bytes be aligned to the physical end
+    ;; of the object so that we can find the function table.
+    ;; But what about other things that create code objects?
+    ;; It could be a subtle source of nondeterministic core images.
 
     ;; FIXME: Sort out 64-bit and cheneygc.
     #+(and 64-bit cheneygc)

@@ -619,15 +619,21 @@
 ;;; should be the right kind of float. Allow bounds for the float
 ;;; part too.
 (defun float-or-complex-float-type (arg &optional lo hi)
-  (declare (type numeric-type arg))
-  (let* ((format (case (numeric-type-class arg)
-                   ((integer rational) 'single-float)
-                   (t (numeric-type-format arg))))
-         (float-type (or format 'float))
-         (lo (coerce-numeric-bound lo float-type))
-         (hi (coerce-numeric-bound hi float-type)))
-    (specifier-type `(or (,float-type ,(or lo '*) ,(or hi '*))
-                         (complex ,float-type)))))
+  (cond
+    ((numeric-type-p arg)
+     (let* ((format (case (numeric-type-class arg)
+                      ((integer rational) 'single-float)
+                      (t (numeric-type-format arg))))
+            (float-type (or format 'float))
+            (lo (coerce-numeric-bound lo float-type))
+            (hi (coerce-numeric-bound hi float-type)))
+       (specifier-type `(or (,float-type ,(or lo '*) ,(or hi '*))
+                            (complex ,float-type)))))
+    ((union-type-p arg)
+     (apply #'type-union
+            (loop for type in (union-type-types arg)
+                  collect (float-or-complex-float-type type lo hi))))
+    (t (specifier-type 'number))))
 
 (eval-when (:compile-toplevel :execute)
   ;; So the problem with this hack is that it's actually broken.  If
@@ -1550,7 +1556,8 @@
                                         * :result result)
                   (let* ((result-type (and result
                                            (lvar-derived-type result)))
-                         (compute-all (and (values-type-p result-type)
+                         (compute-all (and (or (eq result-type *wild-type*)
+                                               (values-type-p result-type))
                                            (not (type-single-value-p result-type)))))
                     (if (or (not y)
                             (and (constant-lvar-p y) (= 1 (lvar-value y))))

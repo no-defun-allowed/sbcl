@@ -66,8 +66,7 @@
 
 extern os_vm_size_t os_vm_page_size;
 
-#if (defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)) \
-  || defined(LISP_FEATURE_LINUX)
+#if defined LISP_FEATURE_WIN32 || defined LISP_FEATURE_LINUX
 boolean os_preinit(char *argv[], char *envp[]);
 #else
 #define os_preinit(dummy1,dummy2) (0)
@@ -109,7 +108,7 @@ extern void os_zero(os_vm_address_t addr, os_vm_size_t length);
 #define IS_GUARD_PAGE    8
 extern os_vm_address_t os_validate(int movable,
                                    os_vm_address_t addr,
-                                   os_vm_size_t len);
+                                   os_vm_size_t len, int execute, int jit);
 
 #ifdef LISP_FEATURE_WIN32
 void* os_commit_memory(os_vm_address_t addr, os_vm_size_t len);
@@ -122,6 +121,11 @@ extern void os_invalidate(os_vm_address_t addr, os_vm_size_t len);
 /* This maps a file into memory, or calls lose(..) for various
  * failures. */
 extern void* load_core_bytes(int fd,
+                             os_vm_offset_t offset,
+                             os_vm_address_t addr,
+                             os_vm_size_t len,
+                             int execute);
+extern void* load_core_bytes_jit(int fd,
                              os_vm_offset_t offset,
                              os_vm_address_t addr,
                              os_vm_size_t len);
@@ -169,12 +173,14 @@ os_context_register_t *os_context_lr_addr(os_context_t *context);
  * system stack pointer for that context. */
 #ifdef ARCH_HAS_STACK_POINTER
 os_context_register_t *os_context_sp_addr(os_context_t *context);
-#if (defined(LISP_FEATURE_X86)||defined(LISP_FEATURE_X86_64)) && \
-    (defined(LISP_FEATURE_DARWIN)||defined(LISP_FEATURE_LINUX)||defined(LISP_FEATURE_WIN32))
+// os_context_fp_addr might not be defined
 os_context_register_t *os_context_fp_addr(os_context_t *context);
-#define os_context_frame_pointer(context) *os_context_fp_addr(context)
+#if defined LISP_FEATURE_X86_64
+#  define os_context_frame_pointer(context) *os_context_register_addr(context,reg_RBP)
+#elif defined LISP_FEATURE_X86
+#  define os_context_frame_pointer(context) *os_context_register_addr(context,reg_EBP)
 #else
-#define os_context_frame_pointer(context) 0
+#  define os_context_frame_pointer(context) 0
 #endif
 #endif
 /* Given a signal context, return the address for storage of the
@@ -222,8 +228,8 @@ extern char *os_get_runtime_executable_path();
 #define OS_VM_SIZE_FMT PRIuPTR
 #define OS_VM_SIZE_FMTX PRIxPTR
 
-#if defined LISP_FEATURE_SB_THREAD && !defined LISP_FEATURE_SB_SAFEPOINT
-#  ifndef CANNOT_USE_POSIX_SEM_T
+#if defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_UNIX
+#  ifndef USE_DARWIN_GCD_SEMAPHORES
 #    include <semaphore.h>
      typedef sem_t os_sem_t;
 #  endif

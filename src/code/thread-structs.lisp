@@ -25,10 +25,8 @@
 ;;; in genesis can properly emulate MAKE-MUTEX for the altered structure,
 ;;; or even better, make sure that genesis can emulate any constructor,
 ;;; provided that it is sufficiently trivial.
-(sb-xc:defstruct (mutex (:constructor make-mutex
-                            (&key name
-                             &aux (counter (unless (null name)
-                                             (find-counter name)))))
+
+(sb-xc:defstruct (mutex (:constructor make-mutex (&key name counter))
                         (:copier nil))
   "Mutex type."
   #+sb-futex (state 0 :type sb-vm:word)
@@ -36,8 +34,7 @@
   ;; which attempts to divine a string from a futex word address.
   (name   nil :type (or null simple-string))
   (%owner nil :type (or null thread))
-  #+sb-record-mutex-misses
-  (counter nil :type (or null t)))
+  (counter nil :read-only t))
 
 (sb-xc:defstruct (waitqueue (:copier nil) (:constructor make-waitqueue (&key name)))
   "Waitqueue type."
@@ -126,7 +123,6 @@ in future versions."
   ;; This is almost-but-not-quite the same as what formerly
   ;; might have been known as the %ALIVE-P flag.
   (%visible 1 :type fixnum)
-  (sigprof-enable (if (eq *profiled-threads* :all) 1 0) :type sb-ext:word)
   (interruptions nil :type list)
   (interruptions-lock
    (make-mutex :name "thread interruptions lock")
@@ -163,14 +159,6 @@ in future versions."
                   (:conc-name "THREAD-"))
   "Type of native threads which are attached to the runtime as Lisp threads
 temporarily.")
-
-#+(and sb-safepoint-strictly (not win32))
-(sb-xc:defstruct (signal-handling-thread
-                  (:copier nil)
-                  (:include foreign-thread)
-                  (:conc-name "THREAD-"))
-  "Asynchronous signal handling thread."
-  (signal-number nil :type integer))
 
 (declaim (sb-ext:freeze-type mutex thread))
 #-sb-xc-host

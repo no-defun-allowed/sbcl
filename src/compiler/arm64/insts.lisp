@@ -14,7 +14,7 @@
 
 (eval-when (:compile-toplevel :load-toplevel :execute)
   ;; Imports from this package into SB-VM
-  (import '(conditional-opcode
+  (import '(conditional-opcode negate-condition
             add-sub-immediate-p fixnum-add-sub-immediate-p
             negative-add-sub-immediate-p
             encode-logical-immediate fixnum-encode-logical-immediate
@@ -47,7 +47,7 @@
     (:al . 14))
   #'equal)
 
-(defconstant-eqx sb-vm::+condition-name-vec+
+(defconstant-eqx +condition-name-vec+
   #.(let ((vec (make-array 16 :initial-element nil)))
       (dolist (cond +conditions+ vec)
         (when (null (aref vec (cdr cond)))
@@ -57,8 +57,8 @@
 (defun conditional-opcode (condition)
   (cdr (assoc condition +conditions+ :test #'eq)))
 
-(defun invert-condition (condition)
-  (aref sb-vm::+condition-name-vec+
+(defun negate-condition (condition)
+  (aref +condition-name-vec+
         (logxor 1 (conditional-opcode condition))))
 
 ;;;; disassembler field definitions
@@ -119,6 +119,7 @@
   (define-arg-type ldr-str-annotation :printer #'annotate-ldr-str-imm)
 
   (define-arg-type ldr-str-reg-annotation :printer #'annotate-ldr-str-reg)
+  (define-arg-type ldr-literal-annotation :printer #'annotate-ldr-literal :sign-extend t)
 
   (define-arg-type label :sign-extend t :use-label #'use-label))
 
@@ -1028,10 +1029,10 @@
 (def-cond-select csneg 1 1)
 
 (define-instruction-macro cset (rd cond)
-  `(inst csinc ,rd zr-tn zr-tn (invert-condition ,cond)))
+  `(inst csinc ,rd zr-tn zr-tn (negate-condition ,cond)))
 
 (define-instruction-macro csetm (rd cond)
-  `(inst csinv ,rd zr-tn zr-tn (invert-condition ,cond)))
+  `(inst csinv ,rd zr-tn zr-tn (negate-condition ,cond)))
 ;;;
 
 (def-emitter cond-compare
@@ -1279,11 +1280,12 @@
   (rt 5 0))
 
 (define-instruction-format (ldr-literal 32
-                            :default-printer '(:name :tab rt ", " label)
+                            :default-printer '(:name :tab rt ", " label literal-annotation)
                             :include ldr-str)
   (op2 :value #b011)
   (label :field (byte 19 5) :type 'label)
-  (rt :fields (list (byte 2 30) (byte 5 0))))
+  (rt :fields (list (byte 2 30) (byte 5 0)))
+  (literal-annotation :field (byte 19 5) :type 'ldr-literal-annotation))
 
 (defun ldr-str-offset-encodable (offset &optional (size 64))
   (or (typep offset '(signed-byte 9))
@@ -2248,10 +2250,10 @@
                                  (ldb (byte 19 2) low)
                                  (tn-offset lip))
                (assemble (segment vop)
-                 (inst movz tmp-tn high 16)
+                 (inst movz dest high 16)
                  (if negative
-                     (inst sub dest lip (lsl tmp-tn 3))
-                     (inst add dest lip (lsl tmp-tn 3))))))
+                     (inst sub dest lip (lsl dest 3))
+                     (inst add dest lip (lsl dest 3))))))
            (one-instruction-emitter (segment position)
              (let ((delta (funcall compute-delta position)))
                ;; ADR
@@ -2312,10 +2314,10 @@
                                  (ldb (byte 19 2) low)
                                  (tn-offset lip))
                (assemble (segment vop)
-                 (inst movz tmp-tn high 16)
-                 (inst ldr dest (@ lip (extend tmp-tn (if negative
-                                                          :sxtw
-                                                          :lsl)
+                 (inst movz dest high 16)
+                 (inst ldr dest (@ lip (extend dest (if negative
+                                                        :sxtw
+                                                        :lsl)
                                                3))))))
             (one-instruction-emitter (segment position)
               (emit-ldr-literal segment
@@ -2707,34 +2709,58 @@
   (let ((sap (code-instructions code)))
     (ecase kind
       (:absolute
-       (setf (sap-ref-word sap offset) value))
+       (setf (sb-vm::sap-ref-word-jit sap offset) value))
       (:layout-id
-       (setf (signed-sap-ref-32 sap offset) value))
+       (setf (sb-vm::signed-sap-ref-32-jit sap offset) value))
       (:cond-branch
-       (setf (ldb (byte 19 5) (sap-ref-32 sap offset))
+       (setf (ldb (byte 19 5) (sb-vm::sap-ref-32-jit sap offset))
              (ash (- value (+ (sap-int sap) offset)) -2)))
       (:uncond-branch
-       (setf (ldb (byte 26 0) (sap-ref-32 sap offset))
+       (setf (ldb (byte 26 0) (sb-vm::sap-ref-32-jit sap offset))
              (ash (- value (+ (sap-int sap) offset)) -2)))))
   nil)
 
-(define-instruction store-coverage-mark (segment path-index temp)
+(define-instruction store-coverage-mark (segment path-index temp #+darwin-jit vector)
   (:emitter
    ;; No backpatch is needed to compute the offset into the code header
    ;; because COMPONENT-HEADER-LENGTH is known at this point.
-   (let* ((offset (+ (component-header-length)
-                     n-word-bytes ; skip over jump table word
-                     path-index
-                     (- other-pointer-lowtag)))
-          (addr
-           (@ sb-vm::code-tn
-              (etypecase offset
-                ((integer 0 4095) offset)
-                ((unsigned-byte 16)
-                 (inst* 'movz segment temp offset 0)
-                 temp)
-                ((unsigned-byte 32)
-                 (inst* 'movz segment temp (ldb (byte 16 16) offset) 16)
-                 (inst* 'movk segment temp (ldb (byte 16 0) offset) 0)
-                 temp)))))
-     (inst* segment 'strb sb-vm::null-tn addr))))
+   (flet ((encode-index (offset &optional word)
+            (cond
+              ((if word
+                   (typep offset '(integer 0 255))
+                   (typep offset '(integer 0 4095)))
+               offset)
+              ((typep offset '(unsigned-byte 16))
+               (inst* segment 'movz temp offset 0)
+               temp)
+              ((typep offset '(unsigned-byte 32))
+               (inst* segment 'movz temp (ldb (byte 16 16) offset) 16)
+               (inst* segment 'movk temp (ldb (byte 16 0) offset) 0)
+               temp)
+              (t
+               (error "Bad offset ~a" offset)))))
+    #-darwin-jit
+    (let* ((offset (+ (component-header-length)
+                      n-word-bytes      ; skip over jump table word
+                      path-index
+                      (- other-pointer-lowtag)))
+           (addr
+             (@ sb-vm::code-tn (encode-index offset))))
+      (inst* segment 'strb sb-vm::null-tn addr))
+    #+darwin-jit
+    (let* ((vector-offset (-
+                           (* n-word-bytes
+                              (- (length (ir2-component-constants
+                                          (component-info *component-being-compiled*)))
+                                 2))
+                           other-pointer-lowtag))
+           (vector-addr
+             (@ sb-vm::code-tn
+                (encode-index vector-offset t)))
+           (offset (+ (* sb-vm:vector-data-offset n-word-bytes)
+                      path-index
+                      (- other-pointer-lowtag)))
+           (addr
+             (@ vector (encode-index offset))))
+      (inst* segment 'ldr vector vector-addr)
+      (inst* segment 'strb sb-vm::null-tn addr)))))

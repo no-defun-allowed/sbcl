@@ -283,10 +283,6 @@ x:
 
 #endif
 
-#ifdef LISP_FEATURE_SB_SAFEPOINT
-/* the CSP page sits right before the thread */
-# define THREAD_SAVED_CSP_OFFSET (-N_WORD_BYTES)
-#endif
 	.text
 
 #ifdef LISP_FEATURE_OS_THREAD_STACK
@@ -535,16 +531,6 @@ lra:
 	andi. reg_NL3, reg_ALLOC, flag_PseudoAtomicInterrupted
 	twnei reg_NL3, 0
 
-#ifdef LISP_FEATURE_SB_SAFEPOINT
-	/* OK to run GC without stopping this thread from this point on. */
-#  ifdef LISP_FEATURE_SB_THREAD
-	stw reg_CSP,THREAD_SAVED_CSP_OFFSET(reg_THREAD)
-#  else
-	load(reg_CFUNC,CSYMBOL(all_threads))
-	stw reg_CSP,THREAD_SAVED_CSP_OFFSET(reg_CFUNC)
-#  endif
-#endif
-
 	mr reg_NL3,reg_NARGS
 
 #ifdef LISP_FEATURE_DARWIN
@@ -587,16 +573,6 @@ lra:
 	li reg_L2,0
 #endif
 	li reg_LIP,0
-
-# ifdef LISP_FEATURE_SB_SAFEPOINT
-	/* No longer OK to run GC except at safepoints. */
-#  ifdef LISP_FEATURE_SB_THREAD
-	stw reg_ZERO,THREAD_SAVED_CSP_OFFSET(reg_THREAD)
-#  else
-	load(reg_BSP,CSYMBOL(all_threads))
-	stw reg_ZERO,THREAD_SAVED_CSP_OFFSET(reg_BSP)
-#  endif
-# endif
 
 	/* Atomic ... */
 	li reg_ALLOC,flag_PseudoAtomic
@@ -660,11 +636,6 @@ lra:
 	.globl CSYMBOL(fun_end_breakpoint_trap)
 	.globl CSYMBOL(fun_end_breakpoint_end)
 
-	/* Due to pointer verification in MAKE-LISP-OBJ, this must
-	include its header data (the offset from the start of the
-	code-object to the LRA). */
-	.long  (((CODE_SIZE+1)&~1)<<N_WIDETAG_BITS)|RETURN_PC_WIDETAG
-
 	/* We are receiving unknown multiple values, thus must deal
 	with the single-value and multiple-value cases separately. */
 	b fun_end_breakpoint_multiple_values
@@ -679,7 +650,8 @@ lra:
 	between the two addresses.
 	Restoring reg_CODE doesn't appear to be strictly necessary
 	here, but let's observe the niceties.*/
-	addi reg_CODE, reg_LRA, ((CODE_SIZE+1)&~1)*-N_WORD_BYTES
+        /* KLUDGE: the extra 2 words are for the jump table prefix and padding. */
+	addi reg_CODE, reg_LRA, (2+((CODE_SIZE+1)&~1))*-N_WORD_BYTES
 
 	/* Multiple values are stored relative to reg_OCFP, which we
 	set to be the current top-of-stack. */
@@ -702,6 +674,7 @@ lra:
 fun_end_breakpoint_multiple_values:
 	/* Compute the correct value for reg_CODE.  See the
 	explanation for the single-value case, above. */
+        /* XXX: I have literally no idea why this constant is -24 */
 	addi reg_CODE, reg_LRA, -24
 
 	/* The actual magic trap. */

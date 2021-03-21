@@ -100,7 +100,7 @@ const char* gc_phase_names[GC_NPHASES] = {
 
 #ifdef LISP_FEATURE_SB_THREAD
 #define CURRENT_THREAD_VAR(name) \
-    struct thread *name = arch_os_get_current_thread()
+    struct thread *name = get_sb_vm_thread()
 #define THREAD_STOP_PENDING(th) \
     read_TLS(STOP_FOR_GC_PENDING, th)
 #define SET_THREAD_STOP_PENDING(th,state) \
@@ -177,7 +177,7 @@ void safepoint_init()
         InitializeConditionVariable(&gc_state.phase_cond[i]);
     InitializeCriticalSection(&gc_state.lock);
 #else
-    os_validate(NOT_MOVABLE, GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES);
+    os_validate(NOT_MOVABLE, GC_SAFEPOINT_PAGE_ADDR, BACKEND_PAGE_BYTES, 0, 0);
 #endif
     gc_state.phase = GC_NONE;
 }
@@ -192,12 +192,12 @@ gc_state_lock()
 #endif
     if (gc_state.master) {
         fprintf(stderr,"GC state lock glitch [%p] in thread %p phase %d (%s)\n",
-                gc_state.master,arch_os_get_current_thread(),gc_state.phase,
+                gc_state.master,get_sb_vm_thread(),gc_state.phase,
                 gc_phase_names[gc_state.phase]);
         odxprint(safepoints,"GC state lock glitch [%p]",gc_state.master);
     }
     gc_assert(!gc_state.master);
-    gc_state.master = arch_os_get_current_thread();
+    gc_state.master = get_sb_vm_thread();
     odxprint(safepoints,"GC state locked in phase %d (%s)",
              gc_state.phase, gc_phase_names[gc_state.phase]);
 }
@@ -207,7 +207,7 @@ gc_state_unlock()
 {
     odxprint(safepoints,"GC state to be unlocked in phase %d (%s)",
              gc_state.phase, gc_phase_names[gc_state.phase]);
-    gc_assert(arch_os_get_current_thread()==gc_state.master);
+    gc_assert(get_sb_vm_thread()==gc_state.master);
     gc_state.master = NULL;
 #ifdef LISP_FEATURE_SB_THREAD
     int result = thread_mutex_unlock(&gc_state.lock);
@@ -219,7 +219,7 @@ gc_state_unlock()
 void
 gc_state_wait(gc_phase_t phase)
 {
-    struct thread* self = arch_os_get_current_thread();
+    struct thread* self = get_sb_vm_thread();
     odxprint(safepoints,"Waiting for %d (%s) -> %d (%s) [%d holders]",
              gc_state.phase, gc_phase_names[gc_state.phase],
              phase, gc_phase_names[phase],
@@ -288,7 +288,7 @@ thread_blocks_gc(struct thread *thread)
     return read_TLS(GC_INHIBIT,thread)==T;
 }
 /* set_thread_csp_access -- alter page permissions for not-in-Lisp
-   flag (Lisp Stack Top) of the thread `p'. The flag may be modified
+   flag (Lisp Stack Top) of the thread `th'. The flag may be modified
    if `writable' is true.
 
    Return true if there is a non-null value in the flag.
@@ -305,18 +305,18 @@ thread_blocks_gc(struct thread *thread)
    are switched to read-only for race-free examine + wait + use
    scenarios. */
 static inline boolean
-set_thread_csp_access(struct thread* p, boolean writable)
+set_thread_csp_access(struct thread* th, boolean writable)
 {
-    os_protect((char *) p - THREAD_CSP_PAGE_SIZE,
+    os_protect((char*)th - (THREAD_HEADER_SLOTS*N_WORD_BYTES) - THREAD_CSP_PAGE_SIZE,
                THREAD_CSP_PAGE_SIZE,
                writable? (OS_VM_PROT_READ|OS_VM_PROT_WRITE)
                : (OS_VM_PROT_READ));
-    return csp_around_foreign_call(p) != 0;
+    return csp_around_foreign_call(th) != 0;
 }
 
 static inline void gc_notify_early()
 {
-    struct thread *self = arch_os_get_current_thread(), *p;
+    struct thread *self = get_sb_vm_thread(), *p;
     odxprint(safepoints,"%s","global notification");
     gc_assert(gc_state.phase == GC_MESSAGE);
     /* We're setting up the per-thread traps to make sure that all
@@ -466,7 +466,7 @@ void
 thread_register_gc_trigger()
 {
     odxprint(misc, "/thread_register_gc_trigger");
-    struct thread *self = arch_os_get_current_thread();
+    struct thread *self = get_sb_vm_thread();
     WITH_GC_STATE_LOCK {
         if (gc_state.phase == GC_NONE &&
             read_TLS(IN_SAFEPOINT,self)!=T &&
@@ -484,11 +484,11 @@ thread_register_gc_trigger()
     }
 }
 
-#ifdef LISP_FEATURE_SB_THRUPTION
+#ifdef LISP_FEATURE_SB_SAFEPOINT
 static inline int
 thread_may_thrupt(os_context_t *ctx)
 {
-    struct thread * self = arch_os_get_current_thread();
+    struct thread * self = get_sb_vm_thread();
     /* Thread may be interrupted if all of these are true:
      * 1) Deferrables are unblocked in the context of the signal that
      *    went into the safepoint.  -- Otherwise the surrounding code
@@ -534,7 +534,7 @@ thread_may_thrupt(os_context_t *ctx)
 int
 check_pending_thruptions(os_context_t *ctx)
 {
-    struct thread *p = arch_os_get_current_thread();
+    struct thread *p = get_sb_vm_thread();
 
 #ifdef LISP_FEATURE_WIN32
     sigset_t oldset;
@@ -631,11 +631,10 @@ static boolean can_invoke_post_gc(struct thread* th)
 }
 
 // returns 0 if skipped, 1 otherwise
-int
-check_pending_gc(os_context_t *ctx)
+int check_pending_gc(__attribute((unused)) os_context_t *ctx)
 {
     odxprint(misc, "check_pending_gc");
-    struct thread * self = arch_os_get_current_thread();
+    struct thread * self = get_sb_vm_thread();
     int done = 0;
     sigset_t sigset;
 
@@ -670,7 +669,7 @@ check_pending_gc(os_context_t *ctx)
 
 void thread_in_lisp_raised(os_context_t *ctxptr)
 {
-    struct thread *self = arch_os_get_current_thread();
+    struct thread *self = get_sb_vm_thread();
     boolean check_gc_and_thruptions = 0;
     odxprint(safepoints,"%s","thread_in_lisp_raised");
 
@@ -741,7 +740,7 @@ void thread_in_lisp_raised(os_context_t *ctxptr)
      * SUB-GC.  Phase is either GC_QUIET or GC_NONE. */
     if (check_gc_and_thruptions) {
         check_pending_gc(ctxptr);
-#ifdef LISP_FEATURE_SB_THRUPTION
+#ifdef LISP_FEATURE_SB_SAFEPOINT
         while(check_pending_thruptions(ctxptr));
 #endif
     }
@@ -749,7 +748,7 @@ void thread_in_lisp_raised(os_context_t *ctxptr)
 
 void thread_in_safety_transition(os_context_t *ctxptr)
 {
-    struct thread *self = arch_os_get_current_thread();
+    struct thread *self = get_sb_vm_thread();
     boolean was_in_alien;
 
     odxprint(safepoints,"%s","GC safety transition");
@@ -799,7 +798,7 @@ void thread_in_safety_transition(os_context_t *ctxptr)
             }
         }
     }
-#ifdef LISP_FEATURE_SB_THRUPTION
+#ifdef LISP_FEATURE_SB_SAFEPOINT
     if (was_in_alien) {
         while(check_pending_thruptions(ctxptr));
     }
@@ -809,7 +808,7 @@ void thread_in_safety_transition(os_context_t *ctxptr)
 #ifdef LISP_FEATURE_WIN32
 void thread_interrupted(os_context_t *ctxptr)
 {
-    struct thread *self = arch_os_get_current_thread();
+    struct thread *self = get_sb_vm_thread();
     boolean gc_active, was_in_alien;
 
     odxprint(safepoints,"%s","pending interrupt trap");
@@ -827,7 +826,7 @@ void thread_interrupted(os_context_t *ctxptr)
         }
     }
     check_pending_gc(ctxptr);
-#ifdef LISP_FEATURE_SB_THRUPTION
+#ifdef LISP_FEATURE_SB_SAFEPOINT
     while(check_pending_thruptions(ctxptr));
 #endif
 }
@@ -836,7 +835,7 @@ void thread_interrupted(os_context_t *ctxptr)
 void
 gc_stop_the_world()
 {
-    struct thread* self = arch_os_get_current_thread();
+    struct thread* self = get_sb_vm_thread();
     odxprint(safepoints, "stop the world");
     WITH_GC_STATE_LOCK {
         /* This thread is the collector, and needs special handling in
@@ -897,7 +896,7 @@ void gc_start_the_world()
 }
 
 
-#ifdef LISP_FEATURE_SB_THRUPTION
+#ifdef LISP_FEATURE_SB_SAFEPOINT
 /* wake_thread(thread) -- ensure a thruption delivery to
  * `thread'. */
 
@@ -942,7 +941,7 @@ void wake_thread_impl(struct thread_instance *lispthread)
 void wake_thread_impl(struct thread_instance *lispthread)
 {
     struct thread *thread = (void*)lispthread->primitive_thread;
-    struct thread *self = arch_os_get_current_thread();
+    struct thread *self = get_sb_vm_thread();
 
     /* Must not and need not attempt to signal ourselves while we're the
      * STW initiator. */
@@ -998,7 +997,7 @@ void wake_thread_impl(struct thread_instance *lispthread)
     thread_sigmask(SIG_SETMASK, &oldset, 0);
 }
 #endif /* !LISP_FEATURE_WIN32 */
-#endif /* LISP_FEATURE_SB_THRUPTION */
+#endif /* LISP_FEATURE_SB_SAFEPOINT */
 
 void* os_get_csp(struct thread* th)
 {
@@ -1013,13 +1012,14 @@ void* os_get_csp(struct thread* th)
 
 #ifndef LISP_FEATURE_WIN32
 
-# ifdef LISP_FEATURE_SB_THRUPTION
+# ifdef LISP_FEATURE_SB_SAFEPOINT
 /* This is basically what 'low_level_maybe_now_maybe_later' was (which doesn't exist),
  * but with a different name, and different way of deciding to defer the signal */
-void
-thruption_handler(int signal, siginfo_t *info, os_context_t *ctx)
+void thruption_handler(__attribute__((unused)) int signal,
+                       __attribute__((unused)) siginfo_t *info,
+                       os_context_t *ctx)
 {
-    struct thread *self = arch_os_get_current_thread();
+    struct thread *self = get_sb_vm_thread();
 
     void *transition_sp = os_get_csp(self);
     if (!transition_sp)
@@ -1051,7 +1051,7 @@ handle_csp_safepoint_violation(lispobj fun, lispobj *args, int nargs);
 int
 handle_safepoint_violation(os_context_t *ctx, os_vm_address_t fault_address)
 {
-    struct thread *self = arch_os_get_current_thread();
+    struct thread *self = get_sb_vm_thread();
 
     FSHOW_SIGNAL((stderr, "fault_address = %p, sp = %p, &csp = %p\n",
                   fault_address,
@@ -1071,7 +1071,7 @@ handle_safepoint_violation(os_context_t *ctx, os_vm_address_t fault_address)
         return 1;
     }
 
-    if (1+(lispobj*)fault_address == (lispobj*)self) {
+    if ((1+THREAD_HEADER_SLOTS)+(lispobj*)fault_address == (lispobj*)self) {
 #ifdef LISP_FEATURE_C_STACK_IS_CONTROL_STACK
         arrange_return_to_c_function(ctx, handle_csp_safepoint_violation, 0);
 #else

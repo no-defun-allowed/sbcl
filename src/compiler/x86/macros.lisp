@@ -59,13 +59,6 @@
   (once-only ((value value))
     `(inst mov (object-slot-ea ,ptr ,slot ,lowtag) ,value)))
 
-;;; A handy utility for storing widetags.
-(defun store-widetag (value ptr &optional (slot 0) (lowtag 0))
-  (inst mov (object-slot-ea
-             ptr slot lowtag
-             (if (typep value '(and integer (not (unsigned-byte 8)))) :word :byte))
-        value))
-
 (defmacro pushw (ptr &optional (slot 0) (lowtag 0))
   `(inst push (object-slot-ea ,ptr ,slot ,lowtag)))
 
@@ -204,9 +197,9 @@
                              (- static-space-start gc-safepoint-trap-offset))))
 
 (defmacro pseudo-atomic ((&key elide-if) &rest forms)
-  #+sb-safepoint-strictly
+  #+sb-safepoint
   `(progn ,@forms (unless ,elide-if (emit-safepoint)))
-  #-sb-safepoint-strictly
+  #-sb-safepoint
   (with-unique-names (label pa-bits-ea)
     `(let ((,label (gen-label))
            (,pa-bits-ea
@@ -223,13 +216,7 @@
          ;; if PAI was set, interrupts were disabled at the same time
          ;; using the process signal mask.
          (inst break pending-interrupt-trap)
-         (emit-label ,label)
-         #+sb-safepoint
-         ;; In this case, when allocation thinks a GC should be done, it
-         ;; does not mark PA as interrupted, but schedules a safepoint
-         ;; trap instead.  Let's take the opportunity to trigger that
-         ;; safepoint right now.
-         (emit-safepoint)))))
+         (emit-label ,label)))))
 
 ;;;; indexed references
 

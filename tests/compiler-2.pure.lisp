@@ -26,6 +26,20 @@
 (defun compiles-with-warning (lambda)
   (assert (nth-value 2 (checked-compile lambda :allow-warnings t))))
 
+(with-test (:name :duplicate-labels)
+  (dolist (operator '(labels flet macrolet))
+    (multiple-value-bind (fun warn err)
+        (let ((*error-output* (make-broadcast-stream)))
+          (compile nil `(lambda (x)
+                          (declare (ignorable x))
+                          (,operator ((f (z) z 2)
+                                      (f (z) z 3))
+                            (f x)))))
+      ;; I'm not asserting on the result of calling FUN
+      ;; because I don't really care what it is.
+      (declare (ignore fun))
+      (assert (and warn err)))))
+
 (with-test (:name (position :derive-type))
   (checked-compile '(lambda (x)
                       (ash 1 (position (the (member a b c) x) #(a b c )))))
@@ -3085,3 +3099,16 @@
      `(lambda ()
         (,name :k 0f0))
      (() 0f0))))
+
+(with-test (:name :no-*-as-type)
+  (multiple-value-bind (fun warn err) (compile nil '(lambda (x) (the * x)))
+    (assert (and warn err))
+    (assert-error (funcall fun 1)))
+  ;; (values t) parses into *wild-type* and has to be allowed
+  ;; even though * which parses into *wild-type* isn't.
+  (checked-compile '(lambda () (the (values t) t))))
+
+(with-test (:name :hairy-data-vector-set-t-upgrade)
+  (checked-compile
+   '(lambda (x) (sb-kernel:hairy-data-vector-set
+                 (the (simple-array symbol) x) 1 'hey))))

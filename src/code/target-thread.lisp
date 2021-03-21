@@ -15,8 +15,6 @@
 (export '(%thread-local-references
           current-thread-sap
           get-spinlock
-          pthread-kill
-          raise
           release-spinlock
           spinlock
           with-deathlok
@@ -243,13 +241,6 @@ an error in that case."
          (let ((new (avl-insert old addr ,thread)))
            (when (eq old (setq old (sb-ext:cas *all-threads* old new))) (return)))))))
 
-(defvar *default-alloc-signal* nil)
-;;; *ALLOC-SIGNAL* is in PER-THREAD-C-INTERFACE-SYMBOLS. Hence it doesn't require
-;;; the aspect of DEFINE-THREAD-LOCAL that ensures a nonzero TLS index.
-;;; (In fact you must not use DEFINE-THREAD-LOCAL, because it's incompatible
-;;; with the numbering assigned to the C interface symbols)
-(defvar sb-vm:*alloc-signal*)
-
 (defun list-all-threads ()
   "Return a list of the live threads. Note that the return value is
 potentially stale even before the function returns, as new threads may be
@@ -267,19 +258,16 @@ created and old ones may exit at any time."
 
 ;;; used by debug-int.lisp to access interrupt contexts
 
+(declaim (inline current-thread-sap))
+(defun current-thread-sap ()
+  #+sb-thread (sb-vm::current-thread-offset-sap sb-vm::thread-this-slot)
+  #-sb-thread (extern-alien "all_threads" system-area-pointer))
+
 #-sb-thread
 (progn
   (declaim (inline sb-vm::current-thread-offset-sap))
   (defun sb-vm::current-thread-offset-sap (n)
-    (sap-ref-sap (alien-sap (extern-alien "all_threads" (* t)))
-                 (* n sb-vm:n-word-bytes))))
-
-(declaim (inline current-thread-sap))
-(defun current-thread-sap ()
-  #+sb-thread
-  (sb-vm::current-thread-offset-sap sb-vm::thread-this-slot)
-  #-sb-thread
-  (int-sap 0))
+    (sap-ref-sap (current-thread-sap) (* n sb-vm:n-word-bytes))))
 
 (sb-ext:define-load-time-global *initial-thread* nil)
 
@@ -316,6 +304,8 @@ created and old ones may exit at any time."
   `(setf (thread-control-stack-start ,this) (get-lisp-obj-address sb-vm:*control-stack-start*)
          (thread-control-stack-end ,this) (get-lisp-obj-address sb-vm:*control-stack-end*)))
 
+(defvar *session*)
+
 ;;; Not uncoincidentally, the variables assigned here are also
 ;;; listed in SB-KERNEL::*SAVE-LISP-CLOBBERED-GLOBALS*
 (defun init-main-thread ()
@@ -331,6 +321,7 @@ created and old ones may exit at any time."
     (init-thread-local-storage thread)
     (setf *initial-thread* thread)
     (setf *joinable-threads* nil)
+    (setq *session* (new-session thread))
     (setq *all-threads*
           (avl-insert nil
                       (sb-thread::thread-primitive-thread sb-thread:*current-thread*)
@@ -412,15 +403,6 @@ See also: RETURN-FROM-THREAD and SB-EXT:EXIT."
 
 #+sb-thread
 (progn
-  (declaim (inline %block-deferrable-signals))
-  (define-alien-routine ("block_deferrable_signals" %block-deferrable-signals)
-      void
-    (where unsigned)
-    (old   unsigned))
-
-  (defun block-deferrable-signals ()
-    (%block-deferrable-signals 0 0))
-
   #+sb-futex
   (progn
     (locally (declare (sb-ext:muffle-conditions sb-ext:compiler-note))
@@ -734,21 +716,30 @@ returns NIL each time."
       t))
    #-sb-futex
    (t
-    (flet ((cas ()
-           (loop repeat 100
-                 when (and (progn
-                             (barrier (:read))
-                             (not (mutex-%owner mutex)))
-                           (not (sb-ext:compare-and-swap (mutex-%owner mutex) nil
-                                                         new-owner)))
-                 do (return-from cas t)
-                 else
-                 do
-                    (sb-ext:spin-loop-hint))
-           ;; Check for pending interrupts.
-           (with-interrupts nil)))
-      (declare (dynamic-extent #'cas))
-      (%%wait-for #'cas stop-sec stop-usec)))))
+    (let ((written? nil))
+      (flet ((cas ()
+               (loop repeat 100
+                     when (and (progn
+                                 (barrier (:read))
+                                 (not (mutex-%owner mutex)))
+                               (not (sb-ext:compare-and-swap (mutex-%owner mutex) nil
+                                                             new-owner)))
+                       do (return-from cas t)
+                     else
+                       do
+                          (sb-ext:spin-loop-hint))
+               (unless written?
+                 (setf written? t)
+                 (let ((counter (mutex-counter mutex)))
+                   (when (arrayp counter)
+                     (locally
+                         (declare ((simple-array sb-ext:word (1)) counter)
+                                  (optimize (speed 3) (safety 0)))
+                       (sb-ext:atomic-incf (aref counter 0))))))
+               ;; Check for pending interrupts.
+               (with-interrupts nil)))
+        (declare (dynamic-extent #'cas))
+        (%%wait-for #'cas stop-sec stop-usec))))))
 
 #+sb-thread
 (defun %wait-for-mutex (mutex self timeout to-sec to-usec stop-sec stop-usec deadlinep)
@@ -1314,8 +1305,6 @@ on this semaphore, then N of them is woken up."
   (interactive-threads-queue (make-waitqueue :name "session")))
 (declaim (sb-ext:freeze-type session))
 
-(defvar *session* nil)
-
 ;;; The debugger itself tries to acquire the session lock, don't let
 ;;; funny situations (like getting a sigint while holding the session
 ;;; lock) occur. At the same time we need to allow interrupts while
@@ -1346,11 +1335,6 @@ on this semaphore, then N of them is woken up."
 (defun new-session (thread)
   (make-session :threads (list thread)
                 :interactive-threads (list thread)))
-
-(defun init-job-control ()
-  (/show0 "Entering INIT-JOB-CONTROL")
-  (setf *session* (new-session *current-thread*))
-  (/show0 "Exiting INIT-JOB-CONTROL"))
 
 (defun %delete-thread-from-session (thread &aux (session *session*))
   (with-session-lock (session)
@@ -1389,21 +1373,22 @@ on this semaphore, then N of them is woken up."
            `((let ((,c-thread (thread-primitive-thread ,thread))) ,@body))
            body)))
 
+(sb-ext:define-load-time-global *sprof-data* nil)
+
 #+sb-thread
 (progn
 ;;; Remove thread from its session, if it has one, and from *all-threads*.
 ;;; Also clobber the pointer to the primitive thread
 ;;; which makes THREAD-ALIVE-P return false hereafter.
 (defmacro handle-thread-exit ()
-  '(progn
-    (/show0 "HANDLING THREAD EXIT")
-    (when *exit-in-progress*
-      (%exit))
-    ;; Lisp-side cleanup
-    (let* ((thread *current-thread*)
+  '(let* ((thread *current-thread*)
            ;; use the "funny fixnum" representation
            (c-thread (%make-lisp-obj (thread-primitive-thread thread)))
            (sem (thread-semaphore thread)))
+      ;; System threads exit peacefully when asked, and they don't bother anyone.
+      ;; They must not participate in shutting other threads down.
+      (when (and *exit-in-progress* (not (thread-ephemeral-p thread)))
+        (%exit))
       ;; This AVER failed when I messed up deletion from *STARTING-THREADS*.
       ;; That in turn caused a failure in GC because a fixnum is not a legal value
       ;; for the startup info when observed by GC.
@@ -1418,7 +1403,26 @@ on this semaphore, then N of them is woken up."
       (with-deathlok (thread)
         (when sem ; ordinary lisp thread, not FOREIGN-THREAD
           (setf (thread-startup-info thread) c-thread))
-        (setf (thread-primitive-thread thread) 0)
+        ;; Accept no further interruptions. Other threads can't add new ones to the queue
+        ;; as doing so requires grabbing the per-thread mutex which we currently own.
+        ;; Deferrable signals are masked at this point, but it is best to tidy up
+        ;; any stray data such as captured closure values.
+        (setf (thread-interruptions thread) nil
+              (thread-primitive-thread thread) 0)
+        (setf (sap-ref-8 (current-thread-sap) ; state_word.sprof_enable
+                         (1+ (ash sb-vm:thread-state-word-slot sb-vm:word-shift)))
+              0)
+        ;; Take ownership of our statistical profiling data and transfer the results to
+        ;; the global pool. This doesn't need to synchronize with the signal handler,
+        ;; which is effectively disabled now, but does synchronize via the interruptions
+        ;; mutex with any other thread trying to read this thread's data.
+        (let ((sprof-data (sb-vm::current-thread-offset-sap sb-vm:thread-sprof-data-slot)))
+          (unless (= (sap-int sprof-data) 0)
+            (setf (sap-ref-word (descriptor-sap c-thread)
+                                (ash sb-vm:thread-sprof-data-slot sb-vm:word-shift))
+                  0)
+            ;; Operation on the global list must be atomic.
+            (sb-ext:atomic-push (cons sprof-data thread) *sprof-data*)))
         (barrier (:write)))
       ;; After making the thread dead, remove from session. If this were done first,
       ;; we'd just waste time moving the thread into SESSION-THREADS (if it wasn't there)
@@ -1457,7 +1461,7 @@ on this semaphore, then N of them is woken up."
         ;; our own kind of semaphore, we simply signal it using an arbitrarily huge count.
         ;; See the comment in 'thread-structs.lisp' about why this isn't CONDITION-BROADCAST
         ;; on a condition var. (Good luck trying to make this many threads)
-        (signal-semaphore sem 1000000)))))
+        (signal-semaphore sem 1000000))))
 
 ;;; The "funny fixnum" address format would do no good - AVL-FIND and AVL-DELETE
 ;;; expect normal happy lisp integers, even if a bignum.
@@ -1822,6 +1826,14 @@ session."
             (without-interrupts
               (unwind-protect
                    (with-local-interrupts
+                     ;; New threads should start with SIGPROF blocked if profiling is enabled
+                     ;; on just a subset of threads. Ideally we'd add to the blocked mask
+                     ;; right now, but it suffices to just leave the enabling bit at its default
+                     ;; of 0; at worst, one undesired signal would be received.
+                     (when (eq *profiled-threads* :all)
+                       (setf (sap-ref-8 (current-thread-sap) ; state_word.sprof_enable
+                                        (1+ (ash sb-vm:thread-state-word-slot sb-vm:word-shift)))
+                             1))
                      (unmask-signals)
                      (let ((list
                              (multiple-value-list
@@ -1830,20 +1842,23 @@ session."
                                        (sb-c::inspect-unwinding
                                         (apply-real-function)
                                         #'sb-di::catch-runaway-unwind))
-                                  (when *exit-in-progress*
+                                  (when (and *exit-in-progress*
+                                             (not (thread-ephemeral-p *current-thread*)))
                                     (sb-impl::call-exit-hooks))))))
                        #+sb-safepoint (sb-kernel::gc-safepoint)
                        (setf (thread-result *current-thread*) list)))
                 ;; we're going down, can't handle interrupts
                 ;; sanely anymore. gc remains enabled.
-                (block-deferrable-signals)
+                (with-alien ((%block (function int system-area-pointer)
+                                     :extern "block_deferrable_signals"))
+                  (alien-funcall %block (int-sap 0)))
                 ;; we don't want to run interrupts in a dead
                 ;; thread when we leave without-interrupts.
                 ;; this potentially causes important
                 ;; interupts to be lost: sigint comes to
                 ;; mind.
                 (setq *interrupt-pending* nil)
-                #+sb-thruption
+                #+sb-safepoint
                 (setq *thruption-pending* nil)
                 (handle-thread-exit)))))))
   ;; this returns to C, so return a single value
@@ -1873,9 +1888,12 @@ See also: RETURN-FROM-THREAD, ABORT-THREAD."
 
 ;;; System-internal use only
 #+sb-thread
-(defun make-ephemeral-thread (name function arguments)
-  (start-thread (%make-thread name t (make-semaphore :name name))
-                function arguments))
+(defun make-system-thread (name function arguments symbol)
+  (let ((thread (%make-thread name t (make-semaphore :name name))))
+    (when symbol
+      (aver (not (symbol-value symbol)))
+      (set symbol thread))
+    (start-thread thread function arguments)))
 
 ;;; This is the faster variant of RUN-THREAD that does not wait for the new
 ;;; thread to start executing before returning.
@@ -2105,32 +2123,12 @@ subject to change."
 (defun destroy-thread (thread)
   (terminate-thread thread))
 
-#-sb-xc-host
 (declaim (sb-ext:deprecated
           :late ("SBCL" "1.2.15")
           (function destroy-thread :replacement terminate-thread)))
 
-;;; raise() is defined to send the signal to pthread_self() if multithreaded.
-(defmacro raise (signal)
-  `(alien-funcall (extern-alien "raise" (function int int)) ,signal))
-
-;;; A macro, because OS-THREAD is a WORD which could cause boxing if passed
-;;; to a function.
-(defmacro pthread-kill (os-thread signal)
-  (declare (ignorable os-thread))
-  ;; If no threads, pthread_kill() won't exist since we didn't link with -lpthread.
-  ;; And raise() - as we use it - can't fail, so just ignore the result.
-  ;; (The signal number is always SIGURG or SIGINT, and the process is obviously not dead)
-  ;; This isn't used on win32 so we don't need to change the symbol to sb_pthr_kill there.
-  #-sb-thread `(raise ,signal)
-  #+sb-thread
-  `(unless (= 0 (alien-funcall (extern-alien "pthread_kill"
-                                             (function int unsigned int))
-                               ,os-thread ,signal))
-     (error "pthread_kill() failed")))
-
 ;;; Called from the signal handler.
-#-(or sb-thruption win32)
+#-(or sb-safepoint win32)
 (defun run-interruption ()
   (let ((interruption (with-deathlok (*current-thread*)
                         (pop (thread-interruptions *current-thread*)))))
@@ -2139,13 +2137,13 @@ subject to change."
     ;; OS's point of view the signal we are in the handler for is no
     ;; longer pending, so the signal will not be lost.
     (when (thread-interruptions *current-thread*)
-      (raise sb-unix:sigurg))
+      (sb-unix:raise sb-unix:sigurg))
     ;; FIXME: does this really respect the promised ordering of interruptions?
     ;; It looks backwards to raise first and run the popped function second.
     (when interruption
       (funcall interruption))))
 
-#+sb-thruption
+#+sb-safepoint
 (defun run-interruption (*current-internal-error-context*)
   (in-interruption () ;the non-thruption code does this in the signal handler
     (let ((interruption (with-deathlok (*current-thread*)
@@ -2174,18 +2172,13 @@ subject to change."
 #+linux
 (defun thread-os-tid (thread)
   (declare (ignorable thread))
-  #+sb-thread
   (if (eq *current-thread* thread)
       (my-kernel-thread-id)
       (with-deathlok (thread c-thread)
         (unless (= c-thread 0)
           (sap-ref-32 (int-sap c-thread)
                       (+ (ash sb-vm::thread-os-kernel-tid-slot sb-vm:word-shift)
-                         #+(and 64-bit big-endian) 4)))))
-  ;; The man page for gettid() says
-  ;;   "In a single-threaded process, the thread ID is equal to the process ID"
-  ;; It probably would be fine to return 0 here; nothing internal uses the value.
-  #-sb-thread (sb-unix:unix-getpid))
+                         #+(and 64-bit big-endian) 4))))))
 
 (defun interrupt-thread (thread function)
   (declare (ignorable thread))
@@ -2241,42 +2234,40 @@ the state of a thread:
   (interrupt-thread thread #'break)
 
 Short version: be careful out there."
-  (macrolet ((enqueue ()
-               ;; Append to the end of the interruptions queue. It's
-               ;; O(N), but it does not hurt to slow interruptors down a
-               ;; bit when the queue gets long.
-              `(setf (thread-interruptions thread)
-                     (append (thread-interruptions thread)
-                             (list (lambda ()
-                                     (barrier (:memory)) ; why???
-                                     (without-interrupts
-                                       (allow-with-interrupts
-                                        (funcall function)))))))))
   ;; POSIX says:
   ;; "If an application attempts to use a thread ID whose lifetime has ended,
   ;;  the behavior is undefined."
   ;; so we use the death lock to keep the thread alive, unless it already isn't.
   ;;
   (when (with-deathlok (thread c-thread)
-          (declare (ignorable c-thread))
           ;; Return T if couldn't interrupt.
-          (cond #+sb-thread ((eql c-thread 0) t)
-                (t
-                 (enqueue)
-                 ;; We use SIGURG because it satisfies a lot of requirements that
-                 ;; other people have thought about more than we have.
-                 ;; See https://golang.org/src/runtime/signal_unix.go where they describe
-                 ;; which signal works best for their sigPreempt.
-                 ;; It's basically the same use-case as here.
-                 #-sb-safepoint (pthread-kill (thread-os-thread thread) sb-unix:sigurg)
-                 #+sb-safepoint
-                 (with-alien ((wake (function void system-area-pointer)
-                                    :extern "wake_thread"))
-                   (with-pinned-objects (thread)
-                     (alien-funcall wake (sap+ (int-sap (get-lisp-obj-address thread))
-                                               (- sb-vm:instance-pointer-lowtag)))))
-                 nil)))
-    (error 'interrupt-thread-error :thread thread))))
+          (cond ((eql c-thread 0) t)
+                (t (%interrupt-thread thread function) nil)))
+    (error 'interrupt-thread-error :thread thread)))
+
+(defun %interrupt-thread (thread function)
+  ;; Append to the end of the interruptions queue. It's
+  ;; O(N), but it does not hurt to slow interruptors down a
+  ;; bit when the queue gets long.
+  (setf (thread-interruptions thread)
+        (append (thread-interruptions thread)
+                ;; It seems to me that this junk should be in RUN-INTERRUPTION,
+                ;; but it doesn't really matter where it goes.
+                (list (lambda ()
+                        (barrier (:memory)) ; why???
+                        (without-interrupts (allow-with-interrupts (funcall function)))))))
+  ;; We use SIGURG because it satisfies a lot of requirements that
+  ;; other people have thought about more than we have.
+  ;; See https://golang.org/src/runtime/signal_unix.go where they describe
+  ;; which signal works best for their sigPreempt.
+  ;; It's basically the same use-case as here.
+  #-sb-safepoint (sb-unix:pthread-kill (thread-os-thread thread) sb-unix:sigurg)
+  #+sb-safepoint
+  (with-alien ((wake (function void system-area-pointer) :extern "wake_thread"))
+    (with-pinned-objects (thread)
+      (alien-funcall wake (sap+ (int-sap (get-lisp-obj-address thread))
+                                (- sb-vm:instance-pointer-lowtag)))))
+  nil)
 
 (defun terminate-thread (thread)
   "Terminate the thread identified by THREAD, by interrupting it and
@@ -2466,8 +2457,6 @@ mechanism for inter-thread communication."
   ;; I wonder how to to prevent user code from doing this, but it isn't a new problem per se.
   ;; Perhaps this should be symbol-macro with a vop behind it and no setf expander.
   (setf *current-thread* thread)
-  ;; This is made thread-local by "src/runtime/genesis/thread-init.inc"
-  (setf sb-vm:*alloc-signal* *default-alloc-signal*)
   thread)
 
 (eval-when (:compile-toplevel)
@@ -2498,33 +2487,36 @@ mechanism for inter-thread communication."
 
 ;;;; Diagnostic tool
 
-#+(and sb-thread sb-devel)
+#+sb-devel
 (defun dump-thread ()
-  (let* ((primobj (find 'sb-vm::thread sb-vm:*primitive-objects*
-                        :key #'sb-vm::primitive-object-name))
+  (let* ((primobj (sb-vm::primitive-object 'sb-vm::thread))
          (slots (sb-vm::primitive-object-slots primobj))
          (sap (current-thread-sap))
          (thread-obj-len (sb-vm::primitive-object-length primobj))
          (names (make-array thread-obj-len :initial-element "")))
-    (dolist (slot slots)
-      (setf (aref names (sb-vm::slot-offset slot)) (sb-vm::slot-name slot)))
+    (loop for slot across slots
+          do
+          (setf (aref names (sb-vm::slot-offset slot)) (sb-vm::slot-name slot)))
     (flet ((safely-read (sap offset)
              (let ((word (sap-ref-word sap offset)))
                (cond ((= word sb-vm:no-tls-value-marker-widetag) :no-tls-value)
                      ((= word sb-vm:unbound-marker-widetag) :unbound)
                      (t (sap-ref-lispobj sap offset)))))
-           (show (tlsindex val)
+           (show (sym val)
              (let ((*print-right-margin* 128)
                    (*print-lines* 4))
                (format t " ~3d ~30a : ~s~%"
-                       (ash tlsindex (- sb-vm:word-shift))
+                       #+sb-thread (ash sym (- sb-vm:word-shift))
+                       #-sb-thread 0
                        ;; FIND-SYMBOL-FROM-TLS-INDEX uses MAP-ALLOCATED-OBJECTS
                        ;; which is not defined during cross-compilation.
-                       (funcall 'sb-impl::find-symbol-from-tls-index tlsindex)
+                       #+sb-thread (funcall 'sb-impl::find-symbol-from-tls-index sym)
+                       #-sb-thread sym
                        val))))
       (format t "~&TLS: (base=~x)~%" (sap-int sap))
       (loop for tlsindex from sb-vm:n-word-bytes below
-            (ash sb-vm::*free-tls-index* sb-vm:n-fixnum-tag-bits)
+            #+sb-thread (ash sb-vm::*free-tls-index* sb-vm:n-fixnum-tag-bits)
+            #-sb-thread (ash thread-obj-len sb-vm:word-shift)
             by sb-vm:n-word-bytes
             do (let ((thread-slot-name
                        (if (< tlsindex (ash thread-obj-len sb-vm:word-shift))
@@ -2542,8 +2534,9 @@ mechanism for inter-thread communication."
         (loop
           (when (sap>= from to) (return))
           (let ((val (safely-read from 0))
-                (tlsindex (sap-ref-word from sb-vm:n-word-bytes)))
-            (show tlsindex val))
+                (sym #+sb-thread (sap-ref-word from sb-vm:n-word-bytes) ; a TLS index
+                     #-sb-thread (sap-ref-lispobj from sb-vm:n-word-bytes)))
+            (show sym val))
           (setq from (sap+ from (* sb-vm:binding-size sb-vm:n-word-bytes))))))))
 
 #+sb-record-mutex-misses

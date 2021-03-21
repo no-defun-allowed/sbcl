@@ -46,7 +46,9 @@
 (defun defstruct-classoid-p (classoid)
   ;; It is non-obvious to me why STRUCTURE-CLASSOID-P doesn't
   ;; work instead of this. -- NS 2008-03-14
-  (typep (layout-info (classoid-layout classoid)) 'defstruct-description))
+  (typep #-metaspace (layout-info (classoid-layout classoid))
+         #+metaspace (sb-kernel::wrapper-%info (sb-kernel::classoid-wrapper classoid))
+         'defstruct-description))
 
 ;;; This excludes structure types created with the :TYPE option to
 ;;; DEFSTRUCT. It also doesn't try to deal with types created by
@@ -78,9 +80,12 @@
      (declare (fixnum ,var))
      ,@body))
 
+(define-load-time-global *pcl-misc-random-state* (make-random-state))
+
 (declaim (inline random-fixnum))
 (defun random-fixnum ()
-  (random (1+ most-positive-fixnum)))
+  (random (1+ most-positive-fixnum)
+          (load-time-value *pcl-misc-random-state*)))
 
 ;;; Lambda which executes its body (or not) randomly. Used to drop
 ;;; random cache entries.

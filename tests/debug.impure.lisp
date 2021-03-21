@@ -19,6 +19,15 @@
 (when (eq sb-ext:*evaluator-mode* :interpret)
   (sb-ext:exit :code 104))
 
+#+(or x86 x86-64)
+(with-test (:name :legal-bpt-lra-object)
+  (sb-int:binding* ((code (sb-kernel:fun-code-header #'read))
+                    (sap (sb-sys:sap+ (sb-kernel:code-instructions code) 13)) ; random
+                    ((bpt-sap bpt-code-obj) (sb-di::make-bpt-lra sap)))
+    (declare (ignore bpt-sap))
+    ;; This was causing heap corruption
+    (assert (zerop (sb-kernel:code-jump-table-words bpt-code-obj)))))
+
 
 ;;;; Check that we get debug arglists right.
 
@@ -700,3 +709,9 @@
           (assert (= (file-length fasl1) (file-length fasl2)))
           (loop repeat (file-length fasl1)
                 do (assert (= (read-byte fasl1) (read-byte fasl2)))))))))
+
+;; lp#1901781
+(defun ll-unknown (x y) (declare (optimize (debug 0))) (+ x y))
+(compile 'll-unknown)
+(with-test (:name :unknown-lambda-list)
+  (assert (eq (sb-kernel:%fun-lambda-list #'ll-unknown) :unknown)))

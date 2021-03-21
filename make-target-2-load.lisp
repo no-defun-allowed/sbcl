@@ -58,7 +58,7 @@
            ;; and would probably mess up something if made non-public,
            ;; though I don't think they should all be public.
            :MSAN
-           :SB-SAFEPOINT :SB-SAFEPOINT-STRICTLY
+           :SB-SAFEPOINT
            :SB-THREAD :SB-UNICODE
            ;; Things which (I think) at least one person has requested be kept around
            :SB-LDB
@@ -253,7 +253,10 @@ Please check that all strings which were not recognizable to the compiler
        :all)
       ;; 2. Variables, types, and anything else
       (do-all-symbols (s)
-        (dolist (category '(:variable :type :typed-structure :setf))
+        (let ((expander (sb-int:info :setf :expander s)))
+          (when (typep expander '(cons t (cons string)))
+            (setf (second expander) nil)))
+        (dolist (category '(:variable :type :typed-structure))
           (clear-it (sb-int:info category :documentation s)))
         (clear-it (sb-int:info :random-documentation :stuff s))))
     (when (plusp count)
@@ -409,15 +412,13 @@ Please check that all strings which were not recognizable to the compiler
            ;; overapproximate what we need for contribs and tests
            (member symbol '(sb-vm::map-referencing-objects
                             sb-vm::map-stack-references
-                            sb-vm::thread-profile-data-slot
-                            sb-vm::thread-alloc-region-slot
                             sb-vm::reconstitute-object
                             ;; need this for defining a vop which
                             ;; tests the x86-64 allocation profiler
                             sb-vm::pseudo-atomic
                             ;; Naughty outside-world code uses these.
-                            #+x86-64 sb-vm::reg-in-size
-                            sb-vm::thread-control-stack-start-slot))
+                            #+x86-64 sb-vm::reg-in-size))
+           (let ((s (string symbol))) (and (search "THREAD-" s) (search "-SLOT" s)))
            (search "-OFFSET" (string symbol))
            (search "-TN" (string symbol))))
       ((#.(find-package "SB-C")

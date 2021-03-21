@@ -83,7 +83,6 @@
          id
          (sb-fasl::write-slots
           (sb-fasl::allocate-struct-of-type 'meta-info)
-          'meta-info ; pass the type name in lieu of layout
           :category category :kind kind :type-spec type-spec
           :type-checker checker :validate-function validator
           :default default :number id))))
@@ -530,9 +529,7 @@
   :type-spec (or null sb-alien-internals:alien-type))
 
 ;;;; ":SETF" subsection - Data pertaining to expansion of the omnipotent macro.
-(define-info-type (:setf :documentation) :type-spec (or string null))
-(define-info-type (:setf :expander)
-    :type-spec (or symbol function (cons integer function) null))
+(define-info-type (:setf :expander) :type-spec (or function list))
 
 ;;;; ":CAS" subsection - Like SETF but there are no "inverses", just expanders
 (define-info-type (:cas :expander) :type-spec (or function null))

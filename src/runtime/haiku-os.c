@@ -7,7 +7,8 @@
 #include <stdio.h>
 
 os_vm_address_t
-os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len)
+os_validate(int attributes, os_vm_address_t addr, os_vm_size_t len,
+            int __attribute__((unused)) execute, int __attribute__((unused)) jit)
 {
     int protection = attributes & IS_GUARD_PAGE ? OS_VM_PROT_NONE : OS_VM_PROT_ALL;
     attributes &= ~IS_GUARD_PAGE;
@@ -71,8 +72,9 @@ sigsegv_handler(int signal, siginfo_t *info, os_context_t *context)
     /*fprintf(stderr, "SIGSEGV: pc=%p addr=%p\n",
            context->uc_mcontext.rip, info->si_addr);*/
     os_vm_address_t addr = arch_get_bad_addr(signal, info, context);
-    if (!gencgc_handle_wp_violation(addr))
-        if (!handle_guard_page_triggered(context, addr))
+    if (gencgc_handle_wp_violation(addr)) return;
+
+    if (!handle_guard_page_triggered(context, addr))
             interrupt_handle_now(signal, info, context);
 }
 
@@ -80,9 +82,6 @@ void
 os_install_interrupt_handlers(void)
 {
     ll_install_handler(SIGSEGV, sigsegv_handler);
-#ifdef LISP_FEATURE_SB_THREAD
-    ll_install_handler(SIG_STOP_FOR_GC, sig_stop_for_gc_handler);
-#endif
 }
 
 int pthread_getattr_np(pthread_t thread, pthread_attr_t *attr)

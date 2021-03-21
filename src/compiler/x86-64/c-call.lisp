@@ -247,7 +247,7 @@
    (inst mov res (ea (make-fixup foreign-symbol :foreign-dataref)))))
 
 #+sb-safepoint
-(defconstant thread-saved-csp-offset -1)
+(defconstant thread-saved-csp-offset (- (1+ sb-vm::thread-header-slots)))
 
 (eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
   (defun destroyed-c-registers ()
@@ -264,10 +264,10 @@
       (append
        (loop for gpr in gprs
              collect `(:temporary (:sc any-reg :offset ,gpr :from :eval :to :result)
-                                  ,(car (push (gensym) vars))))
+                                  ,(car (push (sb-xc:gensym) vars))))
        (loop for float to 15
              collect `(:temporary (:sc single-reg :offset ,float :from :eval :to :result)
-                                  ,(car (push (gensym) vars))))
+                                  ,(car (push (sb-xc:gensym) vars))))
        `((:ignore ,@vars))))))
 
 (define-vop (call-out)

@@ -837,33 +837,15 @@
       ((name (classoid-name classoid))
        (layout (let ((res (info :type :compiler-layout name)))
                  (when (and res (not (layout-invalid res))) res)))
-       ((primtype-predicate slot-reader)
+       ((lowtag lowtag-test slot-reader)
         (cond ((csubtypep classoid (specifier-type 'funcallable-instance))
-               (values '(function-with-layout-p object)
-                       '(%fun-layout object)))
-              ((or (csubtypep classoid (specifier-type 'instance))
-                   (eq classoid (specifier-type 'logical-pathname))
-                   ;; CONDITION can't be a funcallable-instance
-                   (csubtypep classoid (specifier-type 'condition)))
-               (values '(%instancep object)
-                       '(%instance-layout object)))))
-       (get-layout-or-return-false
-        (if primtype-predicate
-            ;; Test just one of %INSTANCEP or %FUNCALLABLE-INSTANCE-P
-            `(if ,primtype-predicate ,slot-reader (return-from typep nil))
-            ;; But if we don't know which is will be, try both.
-            ;; This is less general than LAYOUT-OF,and therefore
-            ;; a little quicker to fail, because objects with
-            ;; {LIST|OTHER}-POINTER-LOWTAG can't possibly pass.
-            ;; It's a bit disappointing that STREAM uses this slower path,
-            ;; but some people think it should be possible to create
-            ;; funcallable streams. As a countermeasure, it would be possible to emit
-            ;; slightly better code in a vop.
-            `(cond ((%instancep object) (%instance-layout object))
-                   ((function-with-layout-p object) (%fun-layout object))
-                   (t (return-from typep nil)))))
+               (values sb-vm:fun-pointer-lowtag
+                       '(function-with-layout-p object) '(%fun-layout object)))
+              ((csubtypep classoid (specifier-type 'instance))
+               (values sb-vm:instance-pointer-lowtag
+                       '(%instancep object) '(%instance-layout object)))))
        (depthoid (if layout (layout-depthoid layout) -1))
-       (n-layout (make-symbol "LAYOUT")))
+       (wrapper (make-symbol "LAYOUT")))
 
     ;; Easiest case first: single bit test.
     (cond ((member name '(condition pathname structure-object))
@@ -874,31 +856,34 @@
                              (pathname  +pathname-layout-flag+)
                              (t         +structure-layout-flag+)))))
 
-          ;; Next easiest: Sealed and no subtypes.
+          ;; Next easiest: Sealed and no subtypes. Typically for DEFSTRUCT only.
+          ;; Even if you don't seal a DEFCLASS, we're allowed to assume that things
+          ;; won't change, as per CLHS 3.2.2.3 on Semantic Constraints:
+          ;;  "Classes defined by defclass in the compilation environment must be defined
+          ;;  at run time to have the same superclasses and same metaclass."
+          ;; I think that means we should know the lowtag always. Nonetheless, this isn't
+          ;; an important scenario, and only if you _do_ seal a class could this case be
+          ;; reached; users rarely seal their classes since the standard doesn't say how.
           ((and layout
                 (eq (classoid-state classoid) :sealed)
                 (not (classoid-subclasses classoid)))
-            ;; It's possible to seal a STANDARD-CLASS, not just a STRUCTURE-CLASS,
-            ;; though probably extremely weird. Also the PRED should be set in
-            ;; that event, but it isn't.
-            ;; The crummy dual expressions for the same result are because
-            ;; (BLOCK (RETURN ...)) seems to emit a forward branch in the
-            ;; passing case, but AND emits a forward branch in the failing
-            ;; case which I believe is the better choice.
-            (flet ((check-layout (layout-getter)
-                       (cond ((and (vop-existsp :named sb-vm::layout-eq)
-                                   (equal layout-getter '(%instance-layout object)))
-                              `(sb-vm::layout-eq object ',layout))
-                             (t
-                              `(eq ,layout-getter ',layout)))))
-                (if primtype-predicate
-                    `(and ,primtype-predicate ,(check-layout slot-reader))
-                    `(block typep ,(check-layout get-layout-or-return-false)))))
+           (if lowtag-test
+               `(and ,lowtag-test ,(if (vop-existsp :translate layout-eq)
+                                       `(layout-eq object ,layout ,lowtag)
+                                       `(eq ,slot-reader ,layout)))
+               ;; `(eq ,layout
+               ;;      (if-vop-existsp (:translate %instanceoid-layout)
+               ;;        (%instanceoid-layout object)
+               ;;        ;; Slightly quicker than LAYOUT-OF. See also %PCL-INSTANCE-P
+               ;;        (cond ((%instancep object) (%instance-layout object))
+               ;;              ((funcallable-instance-p object) (%fun-layout object))
+               ;;              (t ,(find-layout 't)))))
+               (bug "Unexpected metatype for ~S" layout)))
 
           ;; All other structure types
           ((and (typep classoid 'structure-classoid) layout)
             ;; structure type tests; hierarchical layout depths
-            (aver (equal primtype-predicate '(%instancep object)))
+            (aver (eql lowtag sb-vm:instance-pointer-lowtag))
             ;; we used to check for invalid layouts here, but in fact that's both unnecessary and
             ;; wrong; it's unnecessary because structure classes can't be redefined, and it's wrong
             ;; because it is quite legitimate to pass an object with an invalid layout
@@ -907,11 +892,11 @@
                     ;; If we allowed structure classes to be mixed in to standard-object,
                     ;; this might have to change to consider object invalidation. Probably would
                     ;; want to track structure classoids that would render this code inadmissible.
-                  (let ((,n-layout (%instance-layout object)))
-                    ,(if (<= depthoid sb-kernel::layout-id-vector-fixed-capacity)
-                         `(%structure-is-a ,n-layout ,layout)
-                         `(and (layout-depthoid-ge ,n-layout ,depthoid)
-                               (%structure-is-a ,n-layout ,layout))))))
+                  ,(if (<= depthoid sb-kernel::layout-id-vector-fixed-capacity)
+                       `(%structure-is-a (%instance-layout object) ,layout)
+                       `(let ((,wrapper (%instance-layout object)))
+                          (and (layout-depthoid-ge ,wrapper ,depthoid)
+                               (%structure-is-a ,wrapper ,layout))))))
 
           ((> depthoid 0)
            ;; fixed-depth ancestors of non-structure types:
@@ -919,28 +904,31 @@
             #+sb-xc-host (when (typep classoid 'static-classoid)
                            ;; should have use :SEALED code above
                            (bug "Non-frozen static classoids?"))
-            (let ((guts `((when (zerop (layout-clos-hash ,n-layout))
-                            (setq ,n-layout
-                                  (truly-the layout
-                                             (update-object-layout object))))
+            (let ((guts `((when (zerop (layout-clos-hash ,wrapper))
+                            (setq ,wrapper (update-object-layout object)))
                           ,(ecase name
                             (stream
-                             `(logtest (layout-flags ,n-layout) ,+stream-layout-flag+))
+                             `(logtest (layout-flags ,wrapper) ,+stream-layout-flag+))
                             (file-stream
-                             `(logtest (layout-flags ,n-layout) ,+file-stream-layout-flag+))
+                             `(logtest (layout-flags ,wrapper) ,+file-stream-layout-flag+))
                             (string-stream
-                             `(logtest (layout-flags ,n-layout) ,+string-stream-layout-flag+))
+                             `(logtest (layout-flags ,wrapper) ,+string-stream-layout-flag+))
                             ;; Testing the type EXTENDED-SEQUENCE tests for #<LAYOUT of SEQUENCE>.
                             ;; It can only arise from a direct invocation of TRANSFORM-INSTANCE-TYPEP,
                             ;; because the lisp type is not a classoid. It's done this way to define
                             ;; the logic once only, instead of both here and src/code/pred.lisp.
                             (sequence
-                             `(eq (data-vector-ref (layout-inherits ,n-layout) 1)
+                             `(eq (data-vector-ref (layout-inherits ,wrapper) 1)
                                   ,layout))))))
-              (if primtype-predicate
-                  `(and ,primtype-predicate (let ((,n-layout ,slot-reader)) ,@guts))
-                  `(block typep
-                     (let ((,n-layout ,get-layout-or-return-false)) ,@guts)))))
+              (if lowtag-test
+                  `(and ,lowtag-test (let ((,wrapper ,slot-reader)) ,@guts))
+                  (if-vop-existsp (:translate %instanceoid-layout)
+                    `(let ((,wrapper (%instanceoid-layout object))) ,@guts)
+                    `(block typep
+                       (let ((,wrapper (cond ((%instancep object) (%instance-layout object))
+                                             ((funcallable-instance-p object) (%fun-layout object))
+                                             (t (return-from typep nil)))))
+                         ,@guts))))))
 
           (t
             `(classoid-cell-typep ',(find-classoid-cell name :create t)

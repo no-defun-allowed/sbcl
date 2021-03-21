@@ -154,7 +154,9 @@
                  (error "Keyword type description is not a two-list: ~S." key))
                (let ((kwd (first key)))
                  (when (find kwd (key-info) :key #'key-info-name)
-                   (error "~@<repeated keyword ~S in lambda list: ~2I~_~S~:>"
+                   (error (sb-format:tokens
+                           "~@<repeated keyword ~S in lambda list: ~2I~_~
+                            ~/sb-impl:print-lambda-list/~:>")
                           kwd lambda-listy-thing))
                  (key-info
                   (make-key-info
@@ -171,13 +173,9 @@
 (defstruct (values-type
             (:include args-type (%bits (pack-ctype-bits values)))
             (:constructor %make-values-type)
-            (:predicate %values-type-p)
             (:copier nil)))
 
-(declaim (inline values-type-p))
-(defun values-type-p (x)
-  (or (eq x *wild-type*)
-      (%values-type-p x)))
+(declaim (freeze-type values-type))
 
 (defun-cached (make-values-type-cached
                :hash-bits 8
@@ -381,10 +379,19 @@
         (if (bounds-unbounded-p low high)
             (if (eq complexp :complex)
                 (specifier-type '(complex float))
-                (specifier-type 'real))
+                (specifier-type 'float))
             (unionize (single-float double-float #+long-float (error "long-float"))
                       (float float)
-                      (single-float double-float))))))
+                      (single-float double-float)))))
+    (when (and (null complexp)
+               (or class format low high))
+      (return-from make-numeric-type
+        (type-union (make-numeric-type :class class :format format
+                                       :low low :high high :enumerable enumerable
+                                       :complexp :complex)
+                    (make-numeric-type :class class :format format
+                                       :low low :high high :enumerable enumerable
+                                       :complexp :real)))))
   (multiple-value-bind (low high)
       (case class
         (integer
@@ -870,7 +877,7 @@
 ;;;  SPECIFIER-TYPE:
 ;;;    disallow (VALUES ...) even if single value, and disallow *
 ;;;  VALUES-SPECIFIER-TYPE:
-;;;    allow VALUES and *
+;;;    allow VALUES, disallow *
 ;;; TYPE-OR-NIL-IF-UNKNOWN:
 ;;;    like SPECIFIER-TYPE, but return NIL if contains unknown
 ;;; all the above are funneled through BASIC-PARSE-TYPESPEC.
@@ -1026,38 +1033,44 @@
 ;;; This takes no CONTEXT (which implies lack of recursion) because
 ;;; you can't reasonably place a VALUES type inside another type.
 (defun values-specifier-type (type-specifier)
-  (dx-let ((context (make-type-context type-specifier)))
-    (basic-parse-typespec type-specifier context)))
+  ;; This catches uses of literal '* where it shouldn't appear, but it
+  ;; accidentally lets other uses slip through. We'd have to catch '*
+  ;; post-type-expansion to be more strict, but it isn't very important.
+  (if (eq type-specifier '*)
+      (error "* is not permitted as a type specifier")
+      (dx-let ((context (make-type-context type-specifier)))
+        (basic-parse-typespec type-specifier context))))
 
 ;;; This is like VALUES-SPECIFIER-TYPE, except that we guarantee to
 ;;; never return a VALUES type.
 ;;; CONTEXT is either an instance of TYPE-CONTEXT or NIL.
 ;;; SUBCONTEXT is a symbol denoting the head of the current expression, or NIL.
 (defun specifier-type (type-specifier &optional context subcontext)
-  (let ((ctype
-         (if context
-             (basic-parse-typespec type-specifier context)
-             (dx-let ((context (make-type-context type-specifier)))
-               (basic-parse-typespec type-specifier context)))))
-    (when (values-type-p ctype)
-      ;; We have to see how it was spelled to give an intelligent message.
-      ;; If it's instance of VALUES-TYPE, then it was spelled as VALUES
-      ;; whereas if it isn't, the user either spelled it as (VALUES) or *.
-      ;; The case where this heuristic doesn't work is a DEFTYPE that expands
-      ;; to *, but that's not worth worrying about.
-      (cond ((or (%values-type-p ctype) (consp type-specifier))
-             (error "VALUES type illegal in this context:~% ~
+  (let* ((ctype
+           (if context
+               (basic-parse-typespec type-specifier context)
+               (dx-let ((context (make-type-context type-specifier)))
+                 (basic-parse-typespec type-specifier context))))
+         (wildp (eq ctype *wild-type*)))
+    ;; We have to see how it was spelled to give an intelligent message.
+    ;; If it's instance of VALUES-TYPE, then it was spelled as VALUES
+    ;; whereas if it isn't, the user either spelled it as (VALUES) or *.
+    ;; The case where this heuristic doesn't work is a DEFTYPE that expands
+    ;; to *, but that's not worth worrying about.
+    (cond ((or (values-type-p ctype)
+               (and wildp (consp type-specifier)))
+           (error "VALUES type illegal in this context:~% ~
                ~/sb-impl:print-type-specifier/"
                   type-specifier))
-            (subcontext
-             (error "* is not permitted as an argument to the ~S type specifier"
-                    subcontext))
-            (t
-             (error "* is not permitted as a type specifier~@[ in the context ~S~]"
-                    ;; If the entire surrounding context is * then there's not much
-                    ;; else to say. Otherwise, show the original expression.
-                    (when (and context (neq (type-context-spec context) '*))
-                      (type-context-spec context))))))
+          (wildp
+           (if subcontext
+               (error "* is not permitted as an argument to the ~S type specifier"
+                      subcontext)
+               (error "* is not permitted as a type specifier~@[ in the context ~S~]"
+                      ;; If the entire surrounding context is * then there's not much
+                      ;; else to say. Otherwise, show the original expression.
+                      (when (and context (neq (type-context-spec context) '*))
+                        (type-context-spec context))))))
     ctype))
 
 (defun single-value-specifier-type (x &optional context)

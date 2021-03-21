@@ -122,11 +122,16 @@
                     (member form lambda-list-keywords)
                     (report-suspicious kind form)))
              (report-suspicious (kind what)
-               (style-warn-once list "suspicious ~A ~S in lambda list: ~S."
+               (style-warn-once list (sb-format:tokens
+                                      "suspicious ~A ~S in lambda list: ~
+                                       ~/sb-impl:print-lambda-list/.")
                                 kind what list)
                nil) ; Avoid "return convention is not fixed" optimizer note
              (need-arg (state)
-               (croak "expecting variable after ~A in: ~S" state list))
+               (croak (sb-format:tokens
+                       "expecting variable after ~A in: ~
+                        ~/sb-impl:print-lambda-list/")
+                      state list))
              (need-symbol (x why)
                (unless (symbolp x)
                  (croak "~A is not a symbol: ~S" why x)))
@@ -179,7 +184,10 @@
                        (symbolp input))
                   (setf rest (list input)))
                  (t
-                  (croak "illegal dotted lambda list: ~S" list)))
+                  (croak (sb-format:tokens
+                          "illegal dotted lambda list: ~
+                           ~/sb-impl:print-lambda-list/")
+                         list)))
            (return))
          (shiftf last-arg arg (pop input))
 
@@ -220,7 +228,10 @@
                           (destructuring-bind "a destructuring lambda list")
                           (defmethod "a specialized lambda list")
                           (t context))))
-                   (croak "~A is not allowed in ~A: ~S" arg where list)))
+                   (croak (sb-format:tokens
+                           "~A is not allowed in ~A: ~
+                            ~/sb-impl:print-lambda-list/")
+                          arg where list)))
 
                ;; &ENVIRONMENT can't intercede between &KEY,&ALLOW-OTHER-KEYS.
                ;; For all other cases it's as if &ENVIRONMENT were never there.
@@ -235,9 +246,14 @@
                ;; a better thing can be said, e.g. &WHOLE must go to the front.
                (cond ((logbitp to-state seen) ; Oops! Been here before.
                       (if (= rest-bits 3)
-                          (croak "~S and ~S are mutually exclusive: ~S"
+                          (croak (sb-format:tokens
+                                  "~S and ~S are mutually exclusive: ~
+                                   ~/sb-impl:print-lambda-list/")
                                  '&body '&rest list)
-                          (croak "repeated ~S in lambda list: ~S" arg list)))
+                          (croak (sb-format:tokens
+                                  "repeated ~S in lambda list: ~
+                                   ~/sb-impl:print-lambda-list/")
+                                 arg list)))
                      ((logbitp state from-states) ; valid transition
                       (setq state to-state
                             seen (logior seen (ash 1 state))
@@ -245,10 +261,11 @@
                      ((logbitp state (bits &whole &rest &more &environment))
                       (need-arg last-arg)) ; Variable expected.
                      (t
-                      (croak (if (state= to-state &whole)
-                                 "~A must appear first in a lambda list: ~S"
-                                 "misplaced ~A in lambda list: ~S")
-                             arg list)))
+                      (croak (sb-format:tokens
+                              "~:[misplaced ~A in lambda list~;~
+                               ~A must appear first in a lambda list~]:
+                               ~/sb-impl:print-lambda-list/")
+                             (state= to-state &whole) arg list)))
                (go LOOP)))
            ;; Fell through, so warn if desired, and fall through some more.
            (unless silent (report-suspicious "variable" arg)))
@@ -256,7 +273,10 @@
          ;; Handle a lambda variable
          (when (logbitp state (bits &allow-other-keys ; Not a collecting state.
                                     :post-env :post-rest :post-more))
-           (croak "expected lambda list keyword at ~S in: ~S" arg list))
+           (croak (sb-format:tokens
+                   "expected lambda list keyword at ~S in: ~
+                    ~/sb-impl:print-lambda-list/")
+                  arg list))
          (let ((item (list arg)))
            (setq tail (if tail (setf (cdr tail) item) (begin-list item))))
          (when (logbitp state (bits &rest &more &whole &environment))
@@ -278,7 +298,9 @@
         (style-warn-once
          list
          (make-condition '&optional-and-&key-in-lambda-list
-                         :format-control "&OPTIONAL and &KEY found in the same lambda list: ~S"
+                         :format-control (sb-format:tokens
+                                          "&OPTIONAL and &KEY found in the same lambda list: ~
+                                           ~/sb-impl:print-lambda-list/")
                          :format-arguments (list list))))
 
       ;; For CONTEXT other than :VALUES-TYPE/:FUNCTION-TYPE we reject

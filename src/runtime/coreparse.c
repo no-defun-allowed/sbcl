@@ -704,13 +704,23 @@ process_directory(int count, struct ndir_entry *entry,
 #endif
         // This order is determined by constants in compiler/generic/genesis
         {0, 0, STATIC_SPACE_START, &static_space_free_pointer},
+
         {0, 0, READ_ONLY_SPACE_START, &read_only_space_free_pointer},
+
+#ifdef LISP_FEATURE_DARWIN_JIT
+        {0, 0, STATIC_CODE_SPACE_START, &static_code_space_free_pointer},
+#endif
+
 #ifdef LISP_FEATURE_IMMOBILE_SPACE
         {FIXEDOBJ_SPACE_SIZE | 1, 0,
             FIXEDOBJ_SPACE_START, &fixedobj_free_pointer},
         {1, 0, VARYOBJ_SPACE_START, &varyobj_free_pointer}
 #endif
     };
+
+#ifdef LISP_FEATURE_DARWIN_JIT
+    static_code_space_free_pointer = (lispobj *)STATIC_CODE_SPACE_START;
+#endif
 
 #if ELFCORE
     if (&lisp_code_start) {
@@ -827,7 +837,9 @@ process_directory(int count, struct ndir_entry *entry,
 #endif
                 {
                     addr = (uword_t)os_validate(sub_2gb_flag ? MOVABLE_LOW : MOVABLE,
-                                                (os_vm_address_t)addr, request);
+                                                (os_vm_address_t)addr, request,
+                                                id == READ_ONLY_CORE_SPACE_ID,
+                                                id == DYNAMIC_CORE_SPACE_ID);
                 }
                 if (!addr) {
                     lose("Can't allocate %#"OBJ_FMTX" bytes for space %ld",
@@ -879,10 +891,28 @@ process_directory(int count, struct ndir_entry *entry,
             }
 
             sword_t offset = os_vm_page_size * (1 + entry->data_page);
-            if (compressed)
+            if (compressed) {
+#ifdef LISP_FEATURE_DARWIN_JIT
+                if (id == READ_ONLY_CORE_SPACE_ID)
+                    os_protect((os_vm_address_t)addr, len, OS_VM_PROT_WRITE);
+#endif
                 inflate_core_bytes(fd, offset + file_offset, (os_vm_address_t)addr, len);
+
+#ifdef LISP_FEATURE_DARWIN_JIT
+                if (id == READ_ONLY_CORE_SPACE_ID)
+                    os_protect((os_vm_address_t)addr, len, OS_VM_PROT_READ | OS_VM_PROT_EXECUTE);
+#endif
+
+            }
             else
-                load_core_bytes(fd, offset + file_offset, (os_vm_address_t)addr, len);
+#ifdef LISP_FEATURE_DARWIN_JIT
+            if (id == DYNAMIC_CORE_SPACE_ID || id == STATIC_CODE_CORE_SPACE_ID) {
+                load_core_bytes_jit(fd, offset + file_offset, (os_vm_address_t)addr, len);
+            } else
+#endif
+              {
+                load_core_bytes(fd, offset + file_offset, (os_vm_address_t)addr, len, id == READ_ONLY_CORE_SPACE_ID);
+            }
         }
 
 #ifdef MADV_MERGEABLE

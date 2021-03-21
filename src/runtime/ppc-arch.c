@@ -95,7 +95,7 @@ boolean
 arch_pseudo_atomic_atomic(os_context_t *context)
 {
 #ifdef LISP_FEATURE_SB_THREAD
-    struct thread *thread = arch_os_get_current_thread();
+    struct thread *thread = get_sb_vm_thread();
 
     if (foreign_function_call_active_p(thread)) {
         return get_pseudo_atomic_atomic(thread);
@@ -111,7 +111,7 @@ arch_pseudo_atomic_atomic(os_context_t *context)
      * The foreign_function_call_active used to live at each call-site
      * to arch_pseudo_atomic_atomic, but this seems clearer.
      * --NS 2007-05-15 */
-    return (!foreign_function_call_active_p(arch_os_get_current_thread())) &&
+    return (!foreign_function_call_active_p(get_sb_vm_thread())) &&
 #endif
         ((*os_context_register_addr(context,reg_ALLOC)) & flag_PseudoAtomic);
 }
@@ -120,7 +120,7 @@ void
 arch_set_pseudo_atomic_interrupted(os_context_t *context)
 {
 #ifdef LISP_FEATURE_SB_THREAD
-    struct thread *thread = arch_os_get_current_thread();
+    struct thread *thread = get_sb_vm_thread();
 
     if (foreign_function_call_active_p(thread)) {
         set_pseudo_atomic_interrupted(thread);
@@ -134,7 +134,7 @@ void
 arch_clear_pseudo_atomic_interrupted(os_context_t *context)
 {
 #ifdef LISP_FEATURE_SB_THREAD
-    struct thread *thread = arch_os_get_current_thread();
+    struct thread *thread = get_sb_vm_thread();
 
     if (foreign_function_call_active_p(thread)) {
         clear_pseudo_atomic_interrupted(thread);
@@ -331,9 +331,12 @@ handle_allocation_trap(os_context_t * context)
     int alloc_trap_p = allocation_trap_p(context);
 
     if (!alloc_trap_p) return 0;
-    gc_assert(!foreign_function_call_active_p(arch_os_get_current_thread()));
-    fake_foreign_function_call(context);
 
+    struct thread* thread = get_sb_vm_thread();
+    gc_assert(!foreign_function_call_active_p(thread));
+    if (gencgc_alloc_profiler && thread->state_word.sprof_enable)
+        record_backtrace_from_context(context, thread);
+    fake_foreign_function_call(context);
     unsigned int *pc = (unsigned int *) (*os_context_pc_addr(context));
 
     /*
@@ -400,7 +403,7 @@ handle_allocation_trap(os_context_t * context)
     char *memory;
     {
         extern lispobj *alloc(sword_t), *alloc_list(sword_t);
-        struct interrupt_data *data = &thread_interrupt_data(arch_os_get_current_thread());
+        struct interrupt_data *data = &thread_interrupt_data(thread);
         data->allocation_trap_context = context;
         memory = (char*)(alloc_trap_p < 0 ? alloc_list(size) : alloc(size));
         data->allocation_trap_context = 0;
@@ -475,7 +478,7 @@ handle_tls_trap(os_context_t * context, uword_t pc, unsigned int code)
     }
     if (!handle_it) return 0;
 
-    struct thread *thread = arch_os_get_current_thread();
+    struct thread *thread = get_sb_vm_thread();
     set_pseudo_atomic_atomic(thread);
 
     int symbol_reg = (prev_inst >> 16) & 31;

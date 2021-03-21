@@ -28,9 +28,7 @@
 #include <string.h>
 #include <inttypes.h>
 #include "sbcl.h"
-#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
-//
-#else
+#ifndef LISP_FEATURE_WIN32
 #include <signal.h>
 #endif
 #include "runtime.h"
@@ -626,7 +624,7 @@ zero_range_with_mmap(os_vm_address_t addr, os_vm_size_t length) {
     {
         void *new_addr;
         os_invalidate(addr, length);
-        new_addr = os_validate(NOT_MOVABLE, addr, length);
+        new_addr = os_validate(NOT_MOVABLE, addr, length, 0, 1);
         if (new_addr == NULL || new_addr != addr) {
             lose("remap_free_pages: page moved, %p ==> %p",
                  addr, new_addr);
@@ -702,7 +700,11 @@ https://www.microsoft.com/en-us/research/wp-content/uploads/2016/02/zero-oopsla-
  */
 static inline void zero_pages(page_index_t start, page_index_t end) {
     if (start <= end)
-        fast_bzero(page_address(start), npage_bytes(1+end-start));
+#ifdef LISP_FEATURE_DARWIN_JIT
+        zero_range_with_mmap(page_address(start), npage_bytes(1+end-start));
+#else
+    fast_bzero(page_address(start), npage_bytes(1+end-start));
+#endif
 }
 /* Zero the address range from START up to but not including END */
 static inline void zero_range(char* start, char* end) {
@@ -743,10 +745,16 @@ void zero_dirty_pages(page_index_t start, page_index_t end, int page_type) {
     // memory that is entirely within GC, then lisp will never use parts of the page.
     // So we can avoid pre-zeroing all codes pages, all unboxed pages,
     // and all boxed pages allocated to gen>=1.
+
+#ifdef LISP_FEATURE_DARWIN_JIT
+    /* Must always zero, as it may need changing the protection bits. */
+    boolean must_zero = 1;
+#else
     boolean usable_by_lisp =
         gc_alloc_generation == 0 || (gc_alloc_generation == SCRATCH_GENERATION
                                      && from_space == 0);
     boolean must_zero = ((page_type == BOXED_PAGE_FLAG && usable_by_lisp) || page_type == 0);
+#endif
 
     if (gc_allocate_dirty) { // For testing only
 #ifdef LISP_FEATURE_64_BIT
@@ -958,6 +966,18 @@ gc_alloc_new_region(sword_t nbytes, int page_type_flag, struct alloc_region *all
     }
 
     zero_dirty_pages(first_page, last_page, page_type_flag);
+
+#ifdef LISP_FEATURE_DARWIN_JIT
+    if (page_type_flag == CODE_PAGE_TYPE) {
+        page_index_t first = first_page;
+        if (page_bytes_used(first) != 0) {
+            first++;
+        }
+        if (last_page >= first) {
+            os_protect(page_address(first), npage_bytes(1+last_page-first), OS_VM_PROT_ALL);
+        }
+    }
+#endif
 
     /* we can do this after releasing free_pages_lock */
     if (gencgc_zero_check) {
@@ -1189,6 +1209,9 @@ gc_alloc_large(sword_t nbytes, int page_type_flag, struct alloc_region *alloc_re
         page_table[page].type = SINGLE_OBJECT_FLAG | page_type_flag;
         page_table[page].gen = gc_alloc_generation;
     }
+
+    zero_dirty_pages(first_page, last_page, page_type_flag);
+
     // Store a filler so that a linear heap walk does not try to examine
     // these pages cons-by-cons (or whatever they happen to look like).
     // A concurrent walk would probably crash anyway, and most certainly
@@ -1222,11 +1245,16 @@ gc_alloc_large(sword_t nbytes, int page_type_flag, struct alloc_region *alloc_re
     if (BOXED_PAGE_FLAG & page_type_flag)
         add_new_area(first_page, 0, nbytes);
 
-    zero_dirty_pages(first_page, last_page, page_type_flag);
     // page may have not needed zeroing, but first word was stored,
     // turning the putative object temporarily into a page filler object.
     // Now turn it back into free space.
     *addr = 0;
+
+#ifdef LISP_FEATURE_DARWIN_JIT
+    if (page_type_flag == CODE_PAGE_TYPE) {
+        os_protect(page_address(first_page), npage_bytes(1+last_page-first_page), OS_VM_PROT_ALL);
+    }
+#endif
 
     return addr;
 }
@@ -1234,7 +1262,7 @@ gc_alloc_large(sword_t nbytes, int page_type_flag, struct alloc_region *alloc_re
 void
 gc_heap_exhausted_error_or_lose (sword_t available, sword_t requested)
 {
-    struct thread *thread = arch_os_get_current_thread();
+    struct thread *thread = get_sb_vm_thread();
     /* Write basic information before doing anything else: if we don't
      * call to lisp this is a must, and even if we do there is always
      * the danger that we bounce back here before the error has been
@@ -1250,7 +1278,7 @@ gc_heap_exhausted_error_or_lose (sword_t available, sword_t requested)
     else {
         /* FIXME: assert free_pages_lock held */
         (void)thread_mutex_unlock(&free_pages_lock);
-#if !(defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD))
+#ifndef LISP_FEATURE_WIN32
         gc_assert(get_pseudo_atomic_atomic(thread));
         clear_pseudo_atomic_atomic(thread);
         if (get_pseudo_atomic_interrupted(thread))
@@ -2729,7 +2757,7 @@ unprotect_oldspace(void)
                     region_bytes += GENCGC_CARD_BYTES;
                 } else {
                     /* Unprotect previous region. */
-                    os_protect(region_addr, region_bytes, OS_VM_PROT_ALL);
+                    os_protect(region_addr, region_bytes, OS_VM_PROT_JIT_ALL);
                     /* First page in new region. */
                     region_addr = page_addr;
                     region_bytes = GENCGC_CARD_BYTES;
@@ -2739,7 +2767,7 @@ unprotect_oldspace(void)
     }
     if (region_addr) {
         /* Unprotect last region. */
-        os_protect(region_addr, region_bytes, OS_VM_PROT_ALL);
+        os_protect(region_addr, region_bytes, OS_VM_PROT_JIT_ALL);
     }
 }
 
@@ -3232,7 +3260,11 @@ write_protect_generation_pages(generation_index_t generation)
               && generation != PSEUDO_STATIC_GENERATION);
 
     while (start  < next_free_page) {
-        if (!protect_page_p(start, generation)) {
+        if (!protect_page_p(start, generation)
+#ifdef LISP_FEATURE_DARWIN_JIT
+            || is_code(page_table[start].type)
+#endif
+            ) {
             ++start;
             continue;
         }
@@ -3248,15 +3280,17 @@ write_protect_generation_pages(generation_index_t generation)
 
         /* Find the extent of pages desiring physical protection */
         for (end = start + 1; end < next_free_page; end++) {
-            if (!protect_page_p(end, generation) || protection_mode(end) == LOGICAL)
+            if (!protect_page_p(end, generation) || protection_mode(end) == LOGICAL
+#ifdef LISP_FEATURE_DARWIN_JIT
+                || is_code(page_table[end].type)
+#endif
+                )
                 break;
             page_table[end].write_protected = 1;
         }
 
         n_hw_prot += end - start;
-        os_protect(page_address(start),
-                   npage_bytes(end - start),
-                   OS_VM_PROT_READ | OS_VM_PROT_EXECUTE);
+        os_protect(page_address(start), npage_bytes(end - start), OS_VM_PROT_JIT_READ);
 
         start = end;
     }
@@ -3269,6 +3303,28 @@ write_protect_generation_pages(generation_index_t generation)
                "/write protected %d of %d pages in generation %d\n",
                n_protected, n_total, generation));
     }
+}
+
+static void unprotect_all_pages()
+{
+#ifndef LISP_FEATURE_DARWIN_JIT
+    os_protect(page_address(0), npage_bytes(next_free_page), OS_VM_PROT_ALL);
+#else
+    page_index_t start = 0, end;
+    while (start  < next_free_page) {
+
+        if(!is_code(page_table[start].type) && page_bytes_used(start)) {
+            for (end = start + 1; end < next_free_page; end++) {
+                if (is_code(page_table[end].type) || !page_bytes_used(end))
+                    break;
+            }
+            os_protect(page_address(start), npage_bytes(end - start), OS_VM_PROT_READ | OS_VM_PROT_WRITE);
+            start = end+1;
+        } else {
+            start++;
+        }
+    }
+#endif
 }
 
 #if !GENCGC_IS_PRECISE
@@ -3342,6 +3398,13 @@ move_pinned_pages_to_newspace()
         }
     }
 }
+
+/* If sb_sprof_enabled was used and the data are not in the final form
+ * (in the *SAMPLES* instance) then all code remains live.
+ * This is a weaker constraint than 'pin_all_dynamic_space_code'
+ * because the latter implies that all code is not potential garbage and not
+ * movable, whereas this only implies not potential garbage */
+int sb_sprof_enabled;
 
 /* Garbage collect a generation. If raise is 0 then the remains of the
  * generation are not raised to the next generation. */
@@ -3438,8 +3501,7 @@ garbage_collect_generation(generation_index_t generation, int raise)
 
         // Unprotect the dynamic space but leave page_table bits alone
         if (ENABLE_PAGE_PROTECTION)
-            os_protect(page_address(0), npage_bytes(next_free_page),
-                       OS_VM_PROT_ALL);
+            unprotect_all_pages();
 
         // Allocate pages from dynamic space for the work queue.
         extern void prepare_for_full_mark_phase();
@@ -3488,7 +3550,7 @@ garbage_collect_generation(generation_index_t generation, int raise)
              * chosen so that the current context on the stack is
              * covered by the stack scan.  See also set_csp_from_context(). */
 #  ifndef LISP_FEATURE_WIN32
-            if (th != arch_os_get_current_thread()) {
+            if (th != get_sb_vm_thread()) {
                 long k = fixnum_value(
                     read_TLS(FREE_INTERRUPT_CONTEXT_INDEX,th));
                 while (k > 0) {
@@ -3500,7 +3562,7 @@ garbage_collect_generation(generation_index_t generation, int raise)
             }
 #  endif
 # elif defined(LISP_FEATURE_SB_THREAD)
-            if(th==arch_os_get_current_thread()) {
+            if(th==get_sb_vm_thread()) {
                 esp = (void*)&raise;
             } else {
                 sword_t i,free;
@@ -3737,6 +3799,42 @@ garbage_collect_generation(generation_index_t generation, int raise)
     if (gc_object_watcher)  scavenge(&gc_object_watcher, 1);
     if (alloc_profile_data) scavenge(&alloc_profile_data, 1);
 
+    /* If SB-SPROF was used, enliven all pages of code.
+     * Note that some objects may have already been transported off the page.
+     * Despite the extra scan, it is more efficient than scanning all trace buffers
+     * and potentially updating them and/or invalidating hashes */
+    if (sb_sprof_enabled) {
+        page_index_t first = 0;
+        while (first < next_free_page) {
+            if (page_table[first].gen != from_space
+                || (page_table[first].type & PAGE_TYPE_MASK) != CODE_PAGE_TYPE
+                || !page_bytes_used(first)) {
+                ++first;
+                continue;
+            }
+            page_index_t last = first;
+            while (!page_ends_contiguous_block_p(last, from_space)) ++last;
+            // [first,last] are inclusive bounds on a code range
+            lispobj* where = (lispobj*)page_address(first);
+            lispobj* limit = (lispobj*)(page_address(last) + page_bytes_used(last));
+            while (where < limit) {
+                if (forwarding_pointer_p(where)) {
+                    lispobj* copy = native_pointer(forwarding_pointer_value(where));
+                    where += sizetab[widetag_of(copy)](copy);
+                } else {
+                    sword_t nwords = sizetab[widetag_of(where)](where);
+                    if (widetag_of(where) == CODE_HEADER_WIDETAG
+                        && code_serialno((struct code*)where) != 0) {
+                        lispobj ptr = make_lispobj(where, OTHER_POINTER_LOWTAG);
+                        scavenge(&ptr, 1);
+                    }
+                    where += nwords;
+                }
+            }
+            first = last + 1;
+        }
+    }
+
     /* Finally scavenge the new_space generation. Keep going until no
      * more objects are moved into the new generation */
     scavenge_newspace(new_space);
@@ -3885,6 +3983,7 @@ extern int finalizer_thread_runflag;
 void
 collect_garbage(generation_index_t last_gen)
 {
+    THREAD_JIT(0);
     generation_index_t gen = 0, i;
     boolean gc_mark_only = 0;
     int raise, more = 0;
@@ -4104,6 +4203,7 @@ collect_garbage(generation_index_t last_gen)
         // as that causes the thread to exit.
         finalizer_thread_runflag = newval ? newval : 1;
     }
+    THREAD_JIT(1);
 }
 
 /* Initialization of gencgc metadata is split into two steps:
@@ -4205,13 +4305,11 @@ static void gc_allocate_ptes()
  * The check for a GC trigger is only performed when the current
  * region is full, so in most cases it's not needed. */
 
+int gencgc_alloc_profiler;
 NO_SANITIZE_MEMORY lispobj*
 lisp_alloc(struct alloc_region *region, sword_t nbytes,
            int page_type_flag, struct thread *thread)
 {
-#ifndef LISP_FEATURE_WIN32
-    lispobj alloc_signal;
-#endif
     os_vm_size_t trigger_bytes = 0;
 
     gc_assert(nbytes > 0);
@@ -4300,19 +4398,16 @@ lisp_alloc(struct alloc_region *region, sword_t nbytes,
         }
     }
 
-#ifndef LISP_FEATURE_WIN32
-    /* for sb-prof, and not supported on Windows yet */
-    alloc_signal = read_TLS(ALLOC_SIGNAL,thread);
-    if ((alloc_signal & FIXNUM_TAG_MASK) == 0) {
-        if ((sword_t) alloc_signal <= 0) {
-            write_TLS(ALLOC_SIGNAL, T, thread);
-            raise(SIGPROF);
-        } else {
-            write_TLS(ALLOC_SIGNAL,
-                           alloc_signal - (1 << N_FIXNUM_TAG_BITS),
-                           thread);
-        }
-    }
+#if !(defined LISP_FEATURE_PPC || defined LISP_FEATURE_PPC64 \
+      || defined LISP_FEATURE_SPARC || defined LISP_FEATURE_WIN32)
+    // Architectures which utilize a trap instruction to invoke the overflow
+    // handler use the signal context from which to record a backtrace.
+    // That's reliable, but access_control_frame_pointer(thread) isn't.
+    // x86[-64] use the ABI frame pointer register which seems not to work
+    // for win32, but sb-sprof never did work there anyway.
+    extern void allocator_record_backtrace(void*, struct thread*);
+    if (gencgc_alloc_profiler && thread->state_word.sprof_enable)
+        allocator_record_backtrace(__builtin_frame_address(0), thread);
 #endif
 
     return (new_obj);
@@ -4324,22 +4419,17 @@ lisp_alloc(struct alloc_region *region, sword_t nbytes,
 # define MY_REGION SINGLE_THREAD_BOXED_REGION
 #endif
 
-#ifdef LISP_FEATURE_SB_SAFEPOINT_STRICTLY
-// FIXME: I suspect that we can forgo manipulation of the PA flag, which appears
-// to have been present here only to satisfy an assertion in lisp_alloc.
+#ifdef LISP_FEATURE_SB_SAFEPOINT
 # define DEFINE_LISP_ENTRYPOINT(name, page_type) \
    lispobj AMD64_SYSV_ABI *name(sword_t nbytes) { \
-    struct thread *self = arch_os_get_current_thread(); \
-    int was_pseudo_atomic = get_pseudo_atomic_atomic(self); \
-    if (!was_pseudo_atomic) set_pseudo_atomic_atomic(self); \
+    struct thread *self = get_sb_vm_thread(); \
     lispobj *result = lisp_alloc(MY_REGION, nbytes, page_type, self); \
-    if (!was_pseudo_atomic) clear_pseudo_atomic_atomic(self); \
     return result; \
    }
 #else
 # define DEFINE_LISP_ENTRYPOINT(name, page_type) \
    NO_SANITIZE_MEMORY lispobj AMD64_SYSV_ABI *name(sword_t nbytes) { \
-    struct thread *self = arch_os_get_current_thread(); \
+    struct thread *self = get_sb_vm_thread(); \
     gc_assert(get_pseudo_atomic_atomic(self)); \
     return lisp_alloc(MY_REGION, nbytes, page_type, self); \
    }
@@ -4411,8 +4501,9 @@ gencgc_handle_wp_violation(void* fault_addr)
         return 0;
 
     } else {
-#if CODE_PAGES_USE_SOFT_PROTECTION
+#if CODE_PAGES_USE_SOFT_PROTECTION || defined (LISP_FEATURE_DARWIN_JIT)
         gc_assert(!is_code(page_table[page_index].type));
+
 #endif
         // There can not be an open region. gc_close_region() does not attempt
         // to flip that bit atomically. Other threads in the wp violation handler
@@ -4511,7 +4602,7 @@ prepare_for_final_gc ()
 #ifdef LISP_FEATURE_SB_THREAD
     // Avoid tenuring of otherwise-dead objects referenced by
     // dynamic bindings which disappear on image restart.
-    struct thread *thread = arch_os_get_current_thread();
+    struct thread *thread = get_sb_vm_thread();
     char *start = (char*)&thread->lisp_thread;
     char *end = (char*)thread + dynamic_values_bytes;
     memset(start, 0, end-start);
@@ -4612,6 +4703,8 @@ gc_and_save(char *filename, boolean prepend_runtime,
     gencgc_alloc_start_page = next_free_page;
     collect_garbage(HIGHEST_NORMAL_GENERATION+1);
 
+    THREAD_JIT(0);
+
     // We always coalesce copyable numbers. Additional coalescing is done
     // only on request, in which case a message is shown (unless verbose=0).
     if (gc_coalesce_string_literals && verbose) {
@@ -4640,6 +4733,7 @@ gc_and_save(char *filename, boolean prepend_runtime,
     if (verbose)
         printf(" done]\n");
 
+    THREAD_JIT(0);
     // Scrub remaining garbage
     zero_all_free_ranges();
     // Assert that defrag will not move the init_function
@@ -4743,21 +4837,44 @@ void gc_load_corefile_ptes(core_entry_elt_t n_ptes, core_entry_elt_t total_bytes
         page_index_t start = 0, end;
         // cf. write_protect_generation_pages()
         while (start  < next_free_page) {
+#ifdef LISP_FEATURE_DARWIN_JIT
+            if(is_code(page_table[start].type)) {
+                for (end = start + 1; end < next_free_page; end++) {
+                    if (non_protectable_page_p(end) || !is_code(page_table[end].type))
+                        break;
+                }
+                os_protect(page_address(start), npage_bytes(end - start), OS_VM_PROT_ALL);
+                start = end+1;
+                continue;
+            }
+#endif
             if (non_protectable_page_p(start)) {
+
                 ++start;
                 continue;
             }
             page_table[start].write_protected = 1;
             for (end = start + 1; end < next_free_page; end++) {
-                if (non_protectable_page_p(end)) break;
+                if (non_protectable_page_p(end)
+#ifdef LISP_FEATURE_DARWIN_JIT
+                    || is_code(page_table[end].type)
+#endif
+                    )
+                    break;
                 page_table[end].write_protected = 1;
             }
-            os_protect(page_address(start),
-                       npage_bytes(end - start),
-                       OS_VM_PROT_READ | OS_VM_PROT_EXECUTE);
+            os_protect(page_address(start), npage_bytes(end - start), OS_VM_PROT_JIT_READ);
             start = end;
         }
     }
+
+#ifdef LISP_FEATURE_DARWIN_JIT
+    /* For some reason doing an early pthread_jit_write_protect_np sometimes fails.
+       Which is weird, because it's done many times in arch_write_linkage_table_entry later.
+       Adding the executable bit here avoids calling pthread_jit_write_protect_np */
+    os_protect((os_vm_address_t)STATIC_CODE_SPACE_START, STATIC_CODE_SPACE_SIZE, OS_VM_PROT_ALL);
+#endif
+
 }
 
 /* Prepare the array of corefile_ptes for save */

@@ -83,7 +83,9 @@
                            #+sb-safepoint
                            ;; Must be just before NIL.
                            (safepoint ,(symbol-value '+backend-page-bytes+) gc-safepoint-page-addr)
-                           (static ,small-space-size))
+                           (static ,small-space-size)
+                           #+darwin-jit
+                           (static-code ,small-space-size))
                          #+immobile-space
                          `((fixedobj ,fixedobj-space-size*)
                            (varyobj ,varyobj-space-size*))))
@@ -145,11 +147,9 @@
     sb-di::handle-breakpoint
     sb-di::handle-single-step-trap
     #+win32 sb-kernel::handle-win32-exception
-    #+sb-thruption sb-thread::run-interruption
+    #+sb-safepoint sb-thread::run-interruption
     enter-alien-callback
-    #+sb-thread sb-thread::enter-foreign-callback
-    #+(and sb-safepoint-strictly (not win32))
-    sb-unix::signal-handler-callback)
+    #+sb-thread sb-thread::enter-foreign-callback)
   #'equal)
 
 ;;; (potentially) static symbols that C code must be able to set/get
@@ -163,9 +163,8 @@
   `((*free-interrupt-context-index* 0)
     (sb-sys:*allow-with-interrupts* t)
     (sb-sys:*interrupts-enabled* t)
-    *alloc-signal*
     sb-sys:*interrupt-pending*
-    #+sb-thruption sb-sys:*thruption-pending*
+    #+sb-safepoint sb-sys:*thruption-pending*
     *in-without-gcing*
     *gc-inhibit*
     *gc-pending*
@@ -245,10 +244,13 @@
   #-sb-thread 1024) ; crazy value
 
 ;;; Thread slots accessed at negative indices relative to struct thread.
-;;; sb-safepoint needs to access one word below thread-base-tn for the
-;;; foreign call safepoint trap word, so this trick doesn't work.
+;;; This number could be 16 for non-safepoint, or for safepoint, 15, so that -16
+;;; would be on the safepoint page. I had trouble with an odd number of slots
+;;; as there seems to be an alignment requirement. 14 works in general, and the
+;;; safepoint slot is -15 which presents no problem.
 (defconstant thread-header-slots
-  (+ #+(and x86-64 (not sb-safepoint)) 16))
+  #+x86-64 14
+  #-x86-64 0)
 
 #+gencgc
 (progn

@@ -13,12 +13,50 @@
 
 ;;;; structure frobbing primitives
 
+;;; This allocator is used by the expansion of MAKE-LOAD-FORM-SAVING-SLOTS
+;;; when given a STRUCTURE-OBJECT.
+(defun allocate-struct (type)
+  (let* ((layout (classoid-layout (the structure-classoid (find-classoid type))))
+         (structure (%make-instance (layout-length layout))))
+    (setf (%instance-layout structure) layout)
+    (dolist (dsd (dd-slots (layout-dd layout)) structure)
+      (when (eq (dsd-raw-type dsd) 't)
+        (setf (%instance-ref structure (dsd-index dsd)) (make-unbound-marker))))))
+
 ;;; Return the value from the INDEXth slot of INSTANCE. This is SETFable.
 ;;; This is used right away in warm compile by MAKE-LOAD-FORM-SAVING-SLOTS,
 ;;; so without it already defined, you can't define it, because you can't dump
 ;;; debug info structures. Were it not for that, this would go in 'stubs'.
 (defun %instance-ref (instance index)
   (%instance-ref instance index))
+
+(defun set-layout-inherits (layout inherits structurep this-id)
+  #-metaspace (setf (layout-inherits layout) inherits)
+  #+metaspace (setf (wrapper-inherits (layout-friend layout)) inherits)
+  ;;; If structurep, and *only* if, store all the inherited layout IDs.
+  ;;; It looks enticing to try to always store "something", but that goes wrong,
+  ;;; because only structure-object layouts are growable, and only structure-object
+  ;;; can store the self-ID in the proper index.
+  ;;; If the depthoid is -1, the self-ID has to go in index 0.
+  ;;; Standard-object layouts are not growable. The inherited layouts are known
+  ;;; only at class finalization time, at which point we've already made the layout.
+  ;;; Hence, the required indirection to the simple-vector of inherits.
+  (with-pinned-objects (layout)
+    ;; The layout-id vector is an array of int32_t starting at the ID-WORD0 slot.
+    ;; We could use (SETF %RAW-INSTANCE-REF/WORD) for 32-bit architectures,
+    ;; but on 64-bit we have to use SAP-REF, so may as well be consistent here
+    ;; and use a SAP either way.
+    (let ((sap (sap+ (int-sap (get-lisp-obj-address layout))
+                     (- (ash (+ sb-vm:instance-slots-offset (get-dsd-index layout id-word0))
+                             sb-vm:word-shift)
+                        sb-vm:instance-pointer-lowtag))))
+      (cond (structurep
+             (loop for i from 0 by 4
+                   for j from 2 below (length inherits) ; skip T and STRUCTURE-OBJECT
+                   do (setf (signed-sap-ref-32 sap i) (layout-id (svref inherits j)))
+                   finally (setf (signed-sap-ref-32 sap i) this-id)))
+            ((not (eql this-id 0))
+             (setf (signed-sap-ref-32 sap 0) this-id))))))
 
 ;;; Normally IR2 converted, definition needed for interpreted structure
 ;;; constructors only.
@@ -57,9 +95,15 @@
 
 ;;; the part of %DEFSTRUCT which makes sense only on the target SBCL
 ;;;
+(defmacro set-layout-equalp-impl (layout newval)
+  `(setf #-metaspace (%instance-ref ,layout
+                                    (get-dsd-index layout equalp-impl))
+         #+metaspace (%instance-ref (layout-friend ,layout)
+                                    (get-dsd-index wrapper equalp-impl))
+        ,newval))
+
 (defun assign-equalp-impl (type-name function)
-  (setf (%instance-ref (find-layout type-name) (get-dsd-index layout equalp-impl))
-        function))
+  (set-layout-equalp-impl (find-layout type-name) function))
 
 (defun %target-defstruct (dd equalp)
   (declare (type defstruct-description dd))
@@ -68,9 +112,10 @@
     (setf (documentation (dd-name dd) 'structure)
           (dd-doc dd)))
 
-  (let* ((classoid (find-classoid (dd-name dd)))
-         (layout (classoid-layout classoid)))
-    (setf (%instance-ref layout (get-dsd-index sb-kernel:layout sb-kernel::equalp-impl))
+  (let ((classoid (find-classoid (dd-name dd))))
+    (let ((layout (classoid-layout classoid)))
+      (set-layout-equalp-impl
+          layout
           (cond ((compiled-function-p equalp) equalp)
                 ((eql (layout-bitmap layout) +layout-all-tagged+)
                  #'sb-impl::instance-equalp)
@@ -97,7 +142,7 @@
                                   0 ; means recurse using EQUALP
                                   (raw-slot-data-comparator rsd)))))
                     (lambda (a b)
-                      (sb-impl::instance-equalp* comparators a b))))))
+                      (sb-impl::instance-equalp* comparators a b)))))))
 
     (dolist (fun *defstruct-hooks*)
       (funcall fun classoid)))

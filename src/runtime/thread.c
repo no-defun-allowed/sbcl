@@ -248,15 +248,41 @@ struct thread *alloc_thread_struct(void*,lispobj);
 #endif
 
 #ifdef LISP_FEATURE_WIN32
-// Need a function callable from assembly code. The inline one won't do.
-// This is basically pthread_getspecific without an argument.
-void* get_current_vm_thread() {
-  return arch_os_get_current_thread();
+// Need a function callable from assembly code, where the inline one won't do.
+void* read_current_thread() {
+  return get_sb_vm_thread();
 }
 #endif
 
 #if defined LISP_FEATURE_DARWIN && defined LISP_FEATURE_SB_THREAD
-    extern pthread_key_t sigwait_bug_mitigation;
+extern pthread_key_t foreign_thread_ever_lispified;
+#endif
+
+#if defined LISP_FEATURE_LINUX && defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_64_BIT
+#define COLLECT_GC_STATS
+#endif
+#ifdef COLLECT_GC_STATS
+static struct timespec gc_start_time;
+static long stw_elapsed,
+    stw_min_duration = LONG_MAX, stw_max_duration, stw_sum_duration,
+    gc_min_duration = LONG_MAX, gc_max_duration, gc_sum_duration;
+int show_gc_stats, n_gcs_done;
+static void summarize_gc_stats(void) {
+    // TODO: also collect things like number of root pages,bytes scanned
+    // and number of pages,bytes copied on average per GC cycle.
+    if (show_gc_stats && n_gcs_done)
+        fprintf(stderr,
+                "\nGC: time-to-stw=%ld,%ld,%ld \u00B5s (min,avg,max) pause=%ld,%ld,%ld \u00B5s over %d GCs\n",
+                stw_min_duration/1000, stw_sum_duration/n_gcs_done/1000, stw_max_duration/1000,
+                gc_min_duration/1000, gc_sum_duration/n_gcs_done/1000, gc_max_duration/1000,
+                n_gcs_done);
+}
+void reset_gc_stats() { // after sb-posix:fork
+    stw_min_duration = LONG_MAX; stw_max_duration = stw_sum_duration = 0;
+    gc_min_duration = LONG_MAX; gc_max_duration = gc_sum_duration = 0;
+    n_gcs_done = 0;
+    show_gc_stats = 1; // won't show if never called reset
+}
 #endif
 
 void create_main_lisp_thread(lispobj function) {
@@ -268,11 +294,12 @@ void create_main_lisp_thread(lispobj function) {
     struct thread *th = alloc_thread_struct(0, NO_TLS_VALUE_MARKER_WIDETAG);
     if (!th || arch_os_thread_init(th)==0 || !init_shared_attr_object())
         lose("can't create initial thread");
+    th->state_word.sprof_enable = 1;
 #if defined LISP_FEATURE_SB_THREAD && !defined LISP_FEATURE_GCC_TLS && !defined LISP_FEATURE_WIN32
     pthread_key_create(&specials, 0);
 #endif
 #if defined LISP_FEATURE_DARWIN && defined LISP_FEATURE_SB_THREAD
-    pthread_key_create(&sigwait_bug_mitigation, 0);
+    pthread_key_create(&foreign_thread_ever_lispified, 0);
 #endif
 #if defined(LISP_FEATURE_X86) || defined(LISP_FEATURE_X86_64)
     lispobj *args = NULL;
@@ -302,6 +329,9 @@ void create_main_lisp_thread(lispobj function) {
     set_thread_stack(th->control_stack_end);
 #endif
 
+#ifdef COLLECT_GC_STATS
+    atexit(summarize_gc_stats);
+#endif
     /* WIN32 has a special stack arrangement, calling
      * call_into_lisp_first_time will put the new stack in the middle
      * of the current stack */
@@ -415,13 +445,15 @@ unregister_thread(struct thread *th,
 
     arch_os_thread_cleanup(th);
 
-#ifndef LISP_FEATURE_SB_SAFEPOINT
     struct extra_thread_data *semaphores = thread_extra_data(th);
+#ifdef LISP_FEATURE_UNIX
+    os_sem_destroy(&semaphores->sprof_sem);
+#endif
+#ifndef LISP_FEATURE_SB_SAFEPOINT
     os_sem_destroy(&semaphores->state_sem);
     os_sem_destroy(&semaphores->state_not_running_sem);
     os_sem_destroy(&semaphores->state_not_stopped_sem);
 #endif
-
 
 #ifdef LISP_FEATURE_MACH_EXCEPTION_HANDLER
     mach_lisp_thread_destroy(th);
@@ -435,7 +467,7 @@ unregister_thread(struct thread *th,
 #endif
 
     /* Undo the association of the current pthread to its `struct thread',
-     * such that we can call arch_os_get_current_thread() later in this
+     * such that we can call get_sb_vm_thread() later in this
      * thread and cleanly get back NULL. */
     /* FIXME: what if, after we blocked signals, someone uses INTERRUPT-THREAD
      * on this thread? It's no longer a lisp thread; I suspect the signal
@@ -559,9 +591,7 @@ void* new_thread_trampoline(void* arg)
                     GUARD_CONTROL_STACK|GUARD_BINDING_STACK|GUARD_ALIEN_STACK);
     funcall0(function);
     unregister_thread(th, &scribble);
-#ifdef LISP_FEATURE_WIN32
     free_thread_struct(th); // no recycling of 'struct thread'
-#endif
 
 #endif
     return 0;
@@ -691,8 +721,10 @@ static void attach_os_thread(init_thread_data *scribble)
 
 static void detach_os_thread(init_thread_data *scribble)
 {
-    struct thread *th = arch_os_get_current_thread();
-
+    struct thread *th = get_sb_vm_thread();
+#ifdef LISP_FEATURE_DARWIN
+    pthread_setspecific(foreign_thread_ever_lispified, (void*)1);
+#endif
     unregister_thread(th, scribble);
 
     /* We have to clear a STOP_FOR_GC signal if pending. Consider:
@@ -709,28 +741,13 @@ static void detach_os_thread(init_thread_data *scribble)
      *  - but STOP_FOR_GC is pending because it was in the blocked set.
      * Bad things happen unless we clear the pending GC signal.
      */
-#ifndef LISP_FEATURE_SB_SAFEPOINT
+#if !defined LISP_FEATURE_SB_SAFEPOINT && !defined LISP_FEATURE_DARWIN
     sigset_t pending;
     sigpending(&pending);
     if (sigismember(&pending, SIG_STOP_FOR_GC)) {
         int sig, rc;
         rc = sigwait(&gc_sigset, &sig);
         gc_assert(rc == 0 && sig == SIG_STOP_FOR_GC);
-#ifdef LISP_FEATURE_DARWIN
-        sigpending(&pending);
-        if (sigismember(&pending, SIG_STOP_FOR_GC)) {
-            // fprintf(stderr, "Trying sigwait bug mitigation\n");
-            pthread_setspecific(sigwait_bug_mitigation, (void*)1);
-            sigfillset(&pending);
-            sigdelset(&pending, SIG_STOP_FOR_GC);
-            // This might hang forever now, because the signal disappears
-            // despite that we just observed it to be pending.
-            // Basically you're screwed one way or the other - either
-            // by a spurious signal or a lost signal.
-            sigsuspend(&pending);
-            // fprintf(stderr, "Back from sigsuspend\n");
-        }
-#endif
     }
 #endif
     put_recyclebin_item(th);
@@ -758,7 +775,7 @@ callback_wrapper_trampoline(
 #endif
     lispobj arg0, lispobj arg1, lispobj arg2)
 {
-    struct thread* th = arch_os_get_current_thread();
+    struct thread* th = get_sb_vm_thread();
     if (!th) {                  /* callback invoked in non-lisp thread */
         init_thread_data scribble;
         attach_os_thread(&scribble);
@@ -833,7 +850,7 @@ callback_wrapper_trampoline(
 
 struct thread *
 alloc_thread_struct(void* spaces, lispobj start_routine) {
-#if defined(LISP_FEATURE_SB_THREAD) || defined(LISP_FEATURE_WIN32)
+#ifdef LISP_FEATURE_SB_THREAD
     unsigned int i;
 #endif
 
@@ -854,7 +871,7 @@ alloc_thread_struct(void* spaces, lispobj start_routine) {
         // if any newly started thread could refer a dead thread's heap objects.
         zeroize_stack = 1;
     } else {
-        spaces = os_validate(MOVABLE|IS_THREAD_STRUCT, NULL, THREAD_STRUCT_SIZE);
+        spaces = os_validate(MOVABLE|IS_THREAD_STRUCT, NULL, THREAD_STRUCT_SIZE, 0, 0);
         if (!spaces) return NULL;
     }
     /* Aligning up is safe as THREAD_STRUCT_SIZE has
@@ -878,6 +895,9 @@ alloc_thread_struct(void* spaces, lispobj start_routine) {
         tls[i] = NO_TLS_VALUE_MARKER_WIDETAG;
     th->lisp_thread = 0; // force it to be always-thread-local, of course
     th->tls_size = dynamic_values_bytes;
+#endif
+#ifdef THREAD_T_NIL_CONSTANTS_SLOT
+    tls[THREAD_T_NIL_CONSTANTS_SLOT] = (NIL << 32) | T;
 #endif
 #if defined LISP_FEATURE_X86_64 && defined LISP_FEATURE_LINUX
     tls[THREAD_MSAN_XOR_CONSTANT_SLOT] = 0x500000000000;
@@ -952,8 +972,14 @@ alloc_thread_struct(void* spaces, lispobj start_routine) {
     os_sem_init(&extra_data->state_not_running_sem, 0);
     os_sem_init(&extra_data->state_not_stopped_sem, 0);
 #endif
+#if defined LISP_FEATURE_UNIX && defined LISP_FEATURE_SB_THREAD
+    os_sem_init(&extra_data->sprof_sem, 0);
+#endif
+    extra_data->sprof_lock = 0;
+    th->sprof_data = 0;
 
     th->state_word.state = STATE_RUNNING;
+    th->state_word.sprof_enable = 0;
     th->state_word.user_thread_p = 1;
 
 #ifdef ALIEN_STACK_GROWS_DOWNWARD
@@ -1039,7 +1065,7 @@ uword_t create_thread(struct thread_instance* instance, lispobj start_routine)
     struct thread *th;
 
     /* Must defend against async unwinds. */
-    if (read_TLS(INTERRUPTS_ENABLED, arch_os_get_current_thread()) != NIL)
+    if (read_TLS(INTERRUPTS_ENABLED, get_sb_vm_thread()) != NIL)
         lose("create_thread is not safe when interrupts are enabled.");
 
     /* Assuming that a fresh thread struct has no lisp objects in it,
@@ -1127,7 +1153,13 @@ void release_gc_lock() { pthread_mutex_unlock(&in_gc_lock); }
  * the memory shouldn't be there) */
 void gc_stop_the_world()
 {
-    struct thread *th, *me = arch_os_get_current_thread();
+#ifdef COLLECT_GC_STATS
+    struct timespec stw_begin_time, stw_end_time;
+    // Measuring the wait time has to use a realtime clock, not a thread clock
+    // because sleeping below in a sem_wait needs to accrue time.
+    clock_gettime(CLOCK_MONOTONIC, &stw_begin_time);
+#endif
+    struct thread *th, *me = get_sb_vm_thread();
     int rc;
 
     /* Keep threads from registering with GC while the world is stopped. */
@@ -1136,26 +1168,21 @@ void gc_stop_the_world()
 
     /* stop all other threads by sending them SIG_STOP_FOR_GC */
     for_each_thread(th) {
-        gc_assert(th->os_thread != 0);
-        /* We were going to extremes here to use acquire semantics on the state,
-         * while NOT ACTUALLY PREVENTING CHANGE OF THAT STATE. i.e. we released the
-         * state lock before returning with the determined state. That's no help.
-         * Just do an atomic load and we're good */
-        int state = get_thread_state(th);
-        if (th != me && state == STATE_RUNNING) {
-            /* This pthread_kill is safe.
-             * A RUNNING thread can transition to DEAD but can't disappear either
-             * in terms of 'struct thread' being unmapped or the pthread exiting,
-             * because it'll be blocked on the all_threads lock */
-            rc = pthread_kill(th->os_thread,SIG_STOP_FOR_GC);
-            /* This used to bogusly check for ESRCH.
-             * I changed the ESRCH case to just fall into lose() */
-            if (rc) {
-                lose("cannot suspend thread %p: %d, %s",
+        if (th != me) {
+            gc_assert(th->os_thread != 0);
+            struct extra_thread_data *semaphores = thread_extra_data(th);
+            os_sem_wait(&semaphores->state_sem, "notify stop");
+            int state = get_thread_state(th);
+            if (state == STATE_RUNNING) {
+                rc = pthread_kill(th->os_thread,SIG_STOP_FOR_GC);
+                /* This used to bogusly check for ESRCH.
+                 * I changed the ESRCH case to just fall into lose() */
+                if (rc) lose("cannot suspend thread %p: %d, %s",
                      // KLUDGE: assume that os_thread can be cast as pointer.
                      // See comment in 'interr.h' about that.
                      (void*)th->os_thread, rc, strerror(rc));
             }
+            os_sem_post(&semaphores->state_sem, "notified stop");
         }
     }
     for_each_thread(th) {
@@ -1165,11 +1192,35 @@ void gc_stop_the_world()
         }
     }
     FSHOW_SIGNAL((stderr,"/gc_stop_the_world:end\n"));
+#ifdef COLLECT_GC_STATS
+    clock_gettime(CLOCK_MONOTONIC, &stw_end_time);
+    stw_elapsed = (stw_end_time.tv_sec - stw_begin_time.tv_sec)*1000000000L
+                + (stw_end_time.tv_nsec - stw_begin_time.tv_nsec);
+    gc_start_time = stw_end_time;
+#endif
 }
 
 void gc_start_the_world()
 {
-    struct thread *th, *me = arch_os_get_current_thread();
+#ifdef COLLECT_GC_STATS
+    struct timespec gc_end_time;
+    clock_gettime(CLOCK_MONOTONIC, &gc_end_time);
+    long gc_elapsed = (gc_end_time.tv_sec - gc_start_time.tv_sec)*1000000000L
+                      + (gc_end_time.tv_nsec - gc_start_time.tv_nsec);
+    if (stw_elapsed < 0 || gc_elapsed < 0) {
+        char errmsg[] = "GC: Negative times?\n";
+        write(2, errmsg, sizeof errmsg-1);
+    } else {
+        stw_sum_duration += stw_elapsed;
+        if (stw_elapsed < stw_min_duration) stw_min_duration = stw_elapsed;
+        if (stw_elapsed > stw_max_duration) stw_max_duration = stw_elapsed;
+        gc_sum_duration += gc_elapsed;
+        if (gc_elapsed < gc_min_duration) gc_min_duration = gc_elapsed;
+        if (gc_elapsed > gc_max_duration) gc_max_duration = gc_elapsed;
+        ++n_gcs_done;
+    }
+#endif
+    struct thread *th, *me = get_sb_vm_thread();
     int lock_ret;
     /* if a resumed thread creates a new thread before we're done with
      * this loop, the new thread will be suspended waiting to acquire
@@ -1243,7 +1294,7 @@ void wake_thread(struct thread_instance* lispthread)
          * there is no need to take locks, roll thread to safepoint
          * etc. */
         struct thread* thread = (void*)lispthread->primitive_thread;
-        if (thread == arch_os_get_current_thread()) {
+        if (thread == get_sb_vm_thread()) {
             sb_pthr_kill(thread, 1); // can't fail
             check_pending_thruptions(NULL);
             return;
@@ -1254,12 +1305,12 @@ void wake_thread(struct thread_instance* lispthread)
         block_deferrable_signals(&oldset);
         thread_mutex_lock(&all_threads_lock);
         sb_pthr_kill(thread, 1); // can't fail
-# ifdef LISP_FEATURE_SB_THRUPTION
+# ifdef LISP_FEATURE_SB_SAFEPOINT
         wake_thread_impl(lispthread);
 # endif
         thread_mutex_unlock(&all_threads_lock);
         thread_sigmask(SIG_SETMASK,&oldset,0);
-#elif defined LISP_FEATURE_SB_THRUPTION
+#elif defined LISP_FEATURE_SB_SAFEPOINT
     wake_thread_impl(lispthread);
 #else
     pthread_kill(lispthread->os_thread, SIGURG);

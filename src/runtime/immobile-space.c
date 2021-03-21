@@ -652,6 +652,19 @@ scavenge_immobile_roots(generation_index_t min_gen, generation_index_t max_gen)
         if (page < 0) break;
         page = next_varyobj_root_page(1+page, end_bitmap_index, genmask);
     }
+    extern int sb_sprof_enabled;
+    if (sb_sprof_enabled) {
+        // Make another pass over all code and enliven all of 'from_space'
+        lispobj* where = (lispobj*)VARYOBJ_SPACE_START;
+        lispobj* limit = varyobj_free_pointer;
+        while (where < limit) {
+            if (widetag_of(where) == CODE_HEADER_WIDETAG
+                && immobile_obj_gen_bits(where) == from_space
+                && code_serialno((struct code*)where) != 0)
+                enliven_immobile_obj(where, 1);
+            where += sizetab[widetag_of(where)](where);
+        }
+    }
     scavenge_immobile_newspace();
 }
 
@@ -1780,14 +1793,14 @@ struct size_class {
 /* Defragmentation needs more size classes than allocation because a
  * restarted core can not discern the original (coarser) size class
  * in which a layout was allocated. It can only use the actual size.
- * 2n+14 words for N from 0..17 gives a range from 14 to 48 words */
-#define MAX_LAYOUT_DEFRAG_SIZE_CLASSES 18
+ * 2n+8 words for N from 0..20 gives a range from 8 to 48 words */
+#define MAX_LAYOUT_DEFRAG_SIZE_CLASSES 21
 static inline int layout_size_class_nwords(int index) {
-    return 14 + 2*index ;
+    return 8 + 2*index ;
 }
 static inline int nwords_to_layout_size_class(unsigned int nwords) {
-    // the smallest layout size class is 14 words
-    int index = nwords <= 14 ? 0 : (nwords - 14)/2;
+    // the smallest layout size class is 8 words
+    int index = nwords <= 8 ? 0 : (nwords - 8)/2;
     if (index >= MAX_LAYOUT_DEFRAG_SIZE_CLASSES)
         lose("Oversized layout: can't defragment");
     return index;

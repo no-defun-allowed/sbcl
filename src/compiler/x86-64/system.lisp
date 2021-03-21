@@ -95,12 +95,12 @@
               (make-fixup test :layout-id)))))
 
 #+compact-instance-header
-;; ~20 instructions vs. 35
-(define-vop (layout-of) ; no translation
+(progn
+;; ~17 instructions vs. 35
+(define-vop ()
     (:policy :fast-safe)
     (:translate layout-of)
-    (:args (object :scs (descriptor-reg))
-           #+nil (layouts :scs (constant)))
+    (:args (object :scs (descriptor-reg)))
     (:temporary (:sc unsigned-reg :offset rax-offset) rax)
     (:results (result :scs (descriptor-reg)))
     (:generator 6
@@ -128,13 +128,6 @@
       (inst jmp  :eq NULL)
       (inst movzx '(:byte :dword) rax object)
       LOAD-FROM-VECTOR
-      #+nil ;; old way
-      (progn
-        (inst mov  result layouts)
-        (inst mov  :dword result
-              (ea (+ (ash vector-data-offset word-shift) (- other-pointer-lowtag))
-                  result rax 8)))
-      ;; new way
       (inst mov :dword result
             (ea (make-fixup '**primitive-object-layouts**
                            :symbol-value
@@ -145,6 +138,20 @@
       NULL
       (inst mov  result (make-fixup 'null :layout))
       DONE))
+(define-vop ()
+    (:policy :fast-safe)
+    (:translate %instanceoid-layout)
+    (:args (object :scs (descriptor-reg) :to :save))
+    (:temporary (:sc unsigned-reg) temp)
+    (:results (result :scs (descriptor-reg)))
+    (:generator 6
+      (inst lea temp (ea -3 object))
+      (inst and temp (lognot #b1000))
+      (inst mov :dword result (make-fixup 't :layout))
+      (inst test :byte temp 15)
+      (inst jmp :ne DONE)
+      (inst mov :dword result (ea 4 temp))
+      DONE)))
 
 (macrolet ((load-type (target source lowtag)
              `(inst movzx '(:byte :dword) ,target (ea (- ,lowtag) ,source))))

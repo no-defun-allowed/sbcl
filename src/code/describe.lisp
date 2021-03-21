@@ -539,13 +539,15 @@
   (let ((*print-circle* nil)
         (*print-level* 24)
         (*print-length* 100))
-    (format stream "~@:_Lambda-list: ~:S" lambda-list)))
+    (format stream "~@:_Lambda-list: ~/sb-impl:print-lambda-list/" lambda-list)))
 
 (defun describe-argument-precedence-order (argument-list stream)
   (let ((*print-circle* nil)
         (*print-level* 24)
         (*print-length* 100))
-    (format stream "~@:_Argument precedence order: ~:A" argument-list)))
+    (format stream "~@:_Argument precedence order: ~
+                    ~/sb-impl:print-lambda-list/"
+            argument-list)))
 
 (defun describe-function-source (function stream)
   (declare (function function))
@@ -683,7 +685,8 @@
                        (format stream "Methods:")
                        (dolist (method methods)
                          (pprint-indent :block 2 stream)
-                         (format stream "~@:_(~A ~{~S ~}~:S)"
+                         (format stream "~@:_(~A ~{~S ~}~
+                                         ~/sb-impl:print-lambda-list/)"
                                  name
                                  (method-qualifiers method)
                                  (sb-pcl::unparse-specializers
@@ -696,12 +699,14 @@
       (describe-block (stream "~A has a compiler-macro:" name)
         (describe-documentation it t stream)
         (describe-function-source it stream)))
+    ;; It seems entirely bogus to claim that, for example (SETF CAR)
+    ;; has a setf expander when what we mean is that CAR has.
     (when (and (consp name) (eq 'setf (car name)) (not (cddr name)))
       (let* ((name2 (second name))
              (expander (info :setf :expander name2)))
-        (cond ((typep expander '(and symbol (not null)))
+        (cond ((typep expander '(cons symbol))
                (describe-block (stream "~A has setf-expansion: ~S"
-                                       name expander)
+                                       name (car expander))
                  (describe-documentation name2 'setf stream)))
               (expander
                (when (listp expander)

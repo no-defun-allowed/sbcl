@@ -1395,8 +1395,10 @@
     `(make-vop-info
       :name ',(vop-parse-name parse)
       ,@(make-vop-info-types parse)
-      :guard ,(when (vop-parse-guard parse)
-                `(lambda () ,(vop-parse-guard parse)))
+      :guard ,(awhen (vop-parse-guard parse)
+                (if (typep it '(cons (eql lambda)))
+                    it
+                    `(lambda (node) (declare (ignore node)) ,it)))
       :note ',(vop-parse-note parse)
       :info-arg-count ,(length (vop-parse-info-args parse))
       :ltn-policy ',(vop-parse-ltn-policy parse)
@@ -1556,6 +1558,8 @@
 ;;;     Specifies a Form that is evaluated in the global environment.
 ;;;     If form returns NIL, then emission of this VOP is prohibited
 ;;;     even when all other restrictions are met.
+;;;     As an additional possibility, if Form is a lambda expression,
+;;;     then it is funcalled with the node under consideration.
 ;;;
 ;;; :VOP-VAR Name
 ;;; :NODE-VAR Name
@@ -1792,8 +1796,8 @@
          (result-count (length (vop-parse-results parse)))
          (info-count (length (vop-parse-info-args parse)))
          (noperands (+ arg-count result-count info-count))
-         (n-node (gensym))
-         (n-block (gensym))
+         (n-node (sb-xc:gensym))
+         (n-block (sb-xc:gensym))
          (n-template (gensym)))
 
     (when (or (vop-parse-more-args parse) (vop-parse-more-results parse))
@@ -1810,7 +1814,7 @@
         (collect ((ibinds)
                   (ivars))
           (dolist (info (subseq operands arg-count (+ arg-count info-count)))
-            (let ((temp (gensym)))
+            (let ((temp (sb-xc:gensym)))
               (ibinds `(,temp ,info))
               (ivars temp)))
 
@@ -1852,7 +1856,7 @@
          (fixed-args (butlast args))
          (fixed-results (butlast results))
          (n-node (gensym))
-         (n-block (gensym))
+         (n-block (sb-xc:gensym))
          (n-template (gensym)))
 
     (unless (or (vop-parse-more-args parse)

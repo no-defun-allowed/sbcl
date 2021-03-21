@@ -298,8 +298,7 @@ sufficiently motivated to do lengthy fixes."
 
 (defun deinit ()
   (call-hooks "save" *save-hooks*)
-  #+sb-wtimer
-  (itimer-emulation-deinit)
+  #+win32 (itimer-emulation-deinit)
   #+sb-thread
   (let (err)
     (with-system-mutex (sb-thread::*make-thread-lock*)
@@ -317,7 +316,8 @@ sufficiently motivated to do lengthy fixes."
             (make-condition 'save-with-multiple-threads-error
                             :interactive-threads interactive
                             :other-threads other)))))
-    (when err (error err)))
+    (when err (error err))
+    (setq sb-thread::*sprof-data* nil))
   (tune-image-for-dump)
   (float-deinit)
   (profile-deinit)

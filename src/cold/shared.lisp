@@ -253,6 +253,7 @@
                           target-feature-list))
              (arch (target-platform-keyword target-feature-list)))
         ;; Win32 conditionally adds :sb-futex in grovel-features.sh
+        #+(or)
         (when (featurep '(:and :sb-thread (:or :linux :freebsd)) target-feature-list)
           (pushnew :sb-futex target-feature-list))
         (when (featurep '(:and :sb-thread (:not :win32)) target-feature-list)
@@ -300,9 +301,6 @@
          ("(and pauseless-threadstart (not sb-thread))"
           ":PAUSELESS-THREADSTART requires :SB-THREAD")
          ("(and sb-safepoint (not sb-thread))" ":SB-SAFEPOINT requires :SB-THREAD")
-         ("(and sb-thruption (not sb-safepoint))" ":SB-THRUPTION requires :SB-SAFEPOINT")
-         ("(and unix sb-safepoint-strictly)"
-          ":SB-SAFEPOINT-STRICTLY not supported on this platform")
          ("(and sb-thread (not (or riscv ppc ppc64 x86 x86-64 arm64)))"
           ":SB-THREAD not supported on selected architecture")
          ("(and gencgc cheneygc)"
@@ -313,10 +311,8 @@
           ":GENCGC not supported on selected architecture")
          ("(not (or gencgc cheneygc))"
           "One of :GENCGC or :CHENEYGC must be enabled")
-         ("(and sb-safepoint (not (or arm64 ppc x86 x86-64)))"
-          ":SB-SAFEPOINT not supported on selected architecture")
-         ("(and sb-safepoint-strictly (not sb-safepoint))"
-          ":SB-SAFEPOINT-STRICTLY requires :SB-SAFEPOINT")
+         ("(and sb-safepoint (not (and (or arm64 x86 x86-64) (or darwin linux win32))))"
+          ":SB-SAFEPOINT not supported on selected arch/OS")
          ("(not (or elf mach-o win32))"
           "No execute object file format feature defined")
          ("(and cons-profiling (not sb-thread))" ":CONS-PROFILING requires :SB-THREAD")

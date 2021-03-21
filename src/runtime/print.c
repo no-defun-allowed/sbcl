@@ -437,12 +437,21 @@ static void brief_struct(lispobj obj)
 #include "genesis/layout.h"
 #include "genesis/defstruct-description.h"
 #include "genesis/defstruct-slot-description.h"
+#ifdef LISP_FEATURE_METASPACE
+#include "genesis/wrapper.h"
+#endif
 static boolean tagged_slot_p(struct layout *layout, int slot_index)
 {
     // Since we're doing this scan, we could return the name
     // and exact raw type.
+#ifdef LISP_FEATURE_METASPACE
+    struct wrapper *wrapper = (void*)(layout->friend-INSTANCE_POINTER_LOWTAG);
+    if (instancep(wrapper->_info)) {
+        struct defstruct_description* dd = (void*)(wrapper->_info-INSTANCE_POINTER_LOWTAG);
+#else
     if (instancep(layout->_info)) {
         struct defstruct_description* dd = (void*)(layout->_info-INSTANCE_POINTER_LOWTAG);
+#endif
         lispobj slots = dd->slots;
         for ( ; slots != NIL ; slots = CONS(slots)->cdr ) {
             struct defstruct_slot_description* dsd =
@@ -638,7 +647,7 @@ static void print_fun_or_otherptr(lispobj obj)
             print_obj("fun: ", symbol_function(ptr-1));
 #ifdef LISP_FEATURE_SB_THREAD
         int tlsindex = tls_index_of((struct symbol*)(ptr-1));
-        struct thread*th = arch_os_get_current_thread();
+        struct thread*th = get_sb_vm_thread();
         if (th != 0 && tlsindex != 0) {
             lispobj v = *(lispobj*)(tlsindex + (char*)th);
             print_obj("tlsval: ", v);
@@ -926,9 +935,17 @@ struct vector * classoid_name(lispobj * classoid)
 }
 struct vector * layout_classoid_name(lispobj * layout)
 {
+#ifdef LISP_FEATURE_METASPACE
+  // layout can't be forwarded, but wrapper could be
+  lispobj* wrapper = native_pointer(((struct layout*)layout)->friend);
+  if (forwarding_pointer_p(wrapper))
+      wrapper = native_pointer(forwarding_pointer_value(wrapper));
+  lispobj classoid = ((struct wrapper*)wrapper)->classoid;
+#else
   if (forwarding_pointer_p(layout))
       layout = native_pointer(forwarding_pointer_value(layout));
   lispobj classoid = ((struct layout*)layout)->classoid;
+#endif
   return instancep(classoid) ? classoid_name(native_pointer(classoid)) : NULL;
 }
 struct vector * instance_classoid_name(lispobj * instance)

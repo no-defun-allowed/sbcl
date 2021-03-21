@@ -362,7 +362,8 @@
 
 (defvar *foo*)
 #+gencgc
-(with-test (:name (sb-ext:search-roots :simple-fun))
+(with-test (:name (sb-ext:search-roots :simple-fun)
+            :broken-on (and :darwin :arm64))
   ;; Tracing a path to a simple fun wasn't working at some point
   ;; because of failure to employ fun_code_header in the right place.
   (setq *foo* (compile nil '(lambda () 42)))
@@ -451,6 +452,7 @@
                      (prevsym "")
                      (nsyms 0))
                  (loop for addr from start to end by 8
+                       repeat 100
                        do (let ((sym (sb-sys:sap-foreign-symbol (sb-sys:int-sap addr))))
                             (when (and sym (string/= sym prevsym))
                               (incf nsyms)

@@ -34,6 +34,7 @@
            "FUNCTION-ARGLIST"
            "FUNCTION-LAMBDA-LIST"
            "FUNCTION-TYPE"
+           "METHOD-COMBINATION-LAMBDA-LIST"
            "DEFTYPE-LAMBDA-LIST"
            "VALID-FUNCTION-NAME-P"
            "FIND-DEFINITION-SOURCE"
@@ -300,11 +301,11 @@ If an unsupported TYPE is requested, the function will return NIL.
                    (eq (car name) 'setf))
           (setf name (cadr name)))
         (let ((expander (info :setf :expander name)))
-          (when expander
-            (find-definition-source
-             (cond ((symbolp expander) (symbol-function expander))
-                   ((listp expander) (cdr expander))
-                   (t expander))))))
+          (cond ((typep expander '(cons symbol))
+                 (translate-source-location (cddr expander)))
+                (expander
+                 (find-definition-source
+                  (if (listp expander) (cdr expander) expander))))))
        ((:structure)
         (let ((class (get-class name)))
           (if class
@@ -492,11 +493,13 @@ If an unsupported TYPE is requested, the function will return NIL.
   (function-lambda-list function))
 
 (defun function-lambda-list (function)
-  "Describe the lambda list for the extended function designator FUNCTION.
+  "Return the lambda list for the extended function designator FUNCTION.
 Works for special-operators, macros, simple functions, interpreted functions,
 and generic functions. Signals an error if FUNCTION is not a valid extended
-function designator."
-  ;; FIXME: sink this logic into SB-KERNEL:%FUN-LAMBDA-LIST and just call that?
+function designator.
+
+If the function does not have a lambda list (compiled with debug 0),
+then two values are returned: (values nil t)"
   (cond ((and (symbolp function) (special-operator-p function))
          (function-lambda-list (info :function :ir1-convert function)))
         ((valid-function-name-p function)
@@ -506,7 +509,10 @@ function designator."
         ((typep function 'generic-function)
          (sb-pcl::generic-function-pretty-arglist function))
         (t
-         (%fun-lambda-list function))))
+         (let ((raw-result (%fun-lambda-list function)))
+           (if (eq raw-result :unknown)
+               (values nil t)
+               (values raw-result nil))))))
 
 (defun deftype-lambda-list (typespec-operator)
   "Returns the lambda list of TYPESPEC-OPERATOR as first return
@@ -520,6 +526,18 @@ value."
     (if (functionp f)
         (values (%fun-lambda-list f) t)
         (values nil nil))))
+
+(defun method-combination-lambda-list (method-combination)
+  "Return the lambda-list of METHOD-COMBINATION designator.
+METHOD-COMBINATION can be a method combination object,
+or a method combination name."
+  (let* ((name (etypecase method-combination
+                 (symbol method-combination)
+                 (method-combination
+                  (sb-pcl::method-combination-type-name method-combination))))
+         (info (or (gethash name sb-pcl::**method-combinations**)
+                   (error "~S: no such method combination." name))))
+    (sb-pcl::method-combination-info-lambda-list info)))
 
 (defun function-type (function-designator)
   "Returns the ftype of FUNCTION-DESIGNATOR, or NIL."

@@ -479,6 +479,16 @@
       (annotate-unknown-values-lvar value)))
   (values))
 
+(defun ltn-analyze-enclose (node)
+  (declare (type enclose node))
+  (let ((lvar (node-lvar node)))
+    (when lvar ; only DX encloses use lvars.
+      (let ((info (make-ir2-lvar *backend-t-primitive-type*)))
+        (setf (lvar-info lvar) info)
+        (setf (ir2-lvar-kind info) :delayed)
+        (setf (ir2-lvar-stack-pointer info)
+              (make-stack-pointer-tn))))))
+
 ;;; We need a special method for %UNWIND-PROTECT that ignores the
 ;;; cleanup function. We don't annotate either arg, since we don't
 ;;; need them at run-time.
@@ -629,7 +639,7 @@
   (let* ((guard (template-guard template))
          (lvar (node-lvar call))
          (dtype (node-derived-type call)))
-    (cond ((and guard (not (funcall guard)))
+    (cond ((and guard (not (funcall guard call)))
            (values nil :guard))
           ((not (template-args-ok template call safe-p))
            (values nil
@@ -794,9 +804,9 @@
                             (template-or-lose 'call-named)))
                        *efficiency-note-cost-threshold*)))
       (dolist (try (fun-info-templates (basic-combination-fun-info call)))
-        (when (> (template-cost try) max-cost) (return)) ; FIXME: UNLESS'd be cleaner.
+        (when (> (template-cost try) max-cost) (return))
         (let ((guard (template-guard try)))
-          (when (and (or (not guard) (funcall guard))
+          (when (and (or (not guard) (funcall guard call))
                      (or (not safe-p)
                          (ltn-policy-safe-p (template-ltn-policy try)))
                      (not (and (eq ltn-policy :safe)
@@ -984,6 +994,7 @@
       (exit (ltn-analyze-exit node))
       (cset (ltn-analyze-set node))
       (cast (ltn-analyze-cast node))
+      (enclose (ltn-analyze-enclose node))
       (mv-combination
        (ecase (basic-combination-kind node)
          (:local

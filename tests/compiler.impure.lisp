@@ -1082,7 +1082,16 @@
              (assert (eq 'number (type-error-expected-type e)))
              :error))))))
 
-(with-test (:name :compiled-debug-funs-leak)
+;;; This tested something which is no longer a thing. There was a hash-table
+;;; named *COMPILED-DEBUG-FUNS* which held on to an arbitrary number of code blobs,
+;;; and it was made weak in git rev 9abfd1a2b2 and then removed in rev a2aa5eceb5
+;;; (except for cheneygc - and I'm not entirely sure that there isn't a way to
+;;; remove it from cheneygc as well, but it wasn't interesting).
+;;; So really it's testing nothing, except that maybe it is.
+;;; But the test doesn't pass with parallel-exec because profiling the code causes
+;;; potentially any and every lambda to be retained when a stack sample is taken.
+;;; So I'm not sure whether to delete or disable this. I guess disable.
+(with-test (:name :compiled-debug-funs-leak :fails-on :parallel-test-runner)
   (sb-ext:gc :full t)
   (let ((usage-before (sb-kernel::dynamic-usage)))
     (dotimes (x 10000)
@@ -2779,6 +2788,19 @@
        ((function *)                  "(FUNCTION *)")
        ((function (function *))       "(FUNCTION (FUNCTION *))")
        ((function (function (eql 1))) "(FUNCTION (FUNCTION (EQL 1))")))))
+
+(with-test (:name (:compiler-messages function :lambda-list))
+  ;; Previously, function lambda lists were sometimes printed
+  ;; confusingly, e.g.:
+  ;;
+  ;;   (function collection) => #'COLLECTION
+  ;;   ((function t))        => (#'T)
+  ;;
+  (handler-case
+      (sb-c::parse-lambda-list '((function t) . a) :context 'defmethod)
+    (error (condition)
+      (assert (search "illegal dotted lambda list: ((FUNCTION T) . A)"
+                      (princ-to-string condition))))))
 
 (with-test (:name :boxed-ref-setf-special
             :skipped-on :interpreter)

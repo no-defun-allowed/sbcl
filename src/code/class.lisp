@@ -31,29 +31,27 @@
 ;;;
 ;;; In each cons, the car is the symbol naming the layout, and the
 ;;; cdr is the layout itself.
-(defvar *!initial-layouts*)
+;;; If #+metaspace then the cdr is actually of type WRAPPER,
+;;; and if #-metaspace then the wrapper is a LAYOUT.
+(defvar *!initial-wrappers*)
 
 ;;; a table mapping class names to layouts for classes we have
 ;;; referenced but not yet loaded. This is initialized from an alist
 ;;; created by genesis describing the layouts that genesis created at
 ;;; cold-load time.
-(define-load-time-global *forward-referenced-layouts*
+(define-load-time-global *forward-referenced-wrappers*
     ;; FIXME: why is the test EQUAL and not EQ? Aren't the keys all symbols?
     (make-hash-table :test 'equal))
+#-sb-xc-host
 (!cold-init-forms
-  ;; *forward-referenced-layouts* is protected by *WORLD-LOCK*
+  ;; *forward-referenced-wrappers* is protected by *WORLD-LOCK*
   ;; so it does not need a :synchronized option.
-  #-sb-xc-host (progn
-                 (/show0 "processing *!INITIAL-LAYOUTS*")
-                 (setq *forward-referenced-layouts* (make-hash-table :test 'equal))
-                 (dovector (x *!initial-layouts*)
-                   (let ((expected (hash-layout-name (car x)))
-                         (actual (layout-clos-hash (cdr x))))
-                     (unless (= actual expected)
-                       (bug "XC layout hash calculation failed")))
-                   (setf (gethash (car x) *forward-referenced-layouts*)
-                         (cdr x)))
-                 (/show0 "done processing *!INITIAL-LAYOUTS*")))
+ (setq *forward-referenced-wrappers* (make-hash-table :test 'equal))
+ (dovector (x *!initial-wrappers*)
+   (let ((expected (hash-layout-name (car x)))
+         (actual (layout-clos-hash (wrapper-friend (cdr x)))))
+     (unless (= actual expected) (bug "XC layout hash calculation failed")))
+   (setf (gethash (car x) *forward-referenced-wrappers*) (cdr x))))
 
 ;;; The LAYOUT structure itself is defined in 'early-classoid.lisp'
 
@@ -78,15 +76,17 @@
   (binding* ((classoid (find-classoid name nil) :exit-if-null) ; threadsafe
              (layout (classoid-layout classoid) :exit-if-null))
     (return-from find-layout layout))
-  (let ((table *forward-referenced-layouts*))
+  (let ((table *forward-referenced-wrappers*))
     (with-world-lock ()
       (let ((classoid (find-classoid name nil)))
         (or (and classoid (classoid-layout classoid))
-            (values (ensure-gethash name table
-                                    (make-layout
-                                     (hash-layout-name name)
-                                     (or classoid
-                                         (make-undefined-classoid name))))))))))
+            (acond ((gethash name table)
+                    (wrapper-friend it))
+                   (t
+                    (let ((new (make-layout (hash-layout-name name)
+                                            (or classoid (make-undefined-classoid name)))))
+                      (setf (gethash name table) (layout-friend new))
+                      new))))))))
 
 ;;; In code for the target Lisp, we don't dump LAYOUTs using the
 ;;; standard load form mechanism, we use special fops instead, in
@@ -195,17 +195,20 @@ between the ~A definition and the ~A definition"
   (let* ((layout
           (or (binding* ((classoid (find-classoid name nil) :exit-if-null))
                 (classoid-layout classoid))
-              (let ((table *forward-referenced-layouts*))
+              (let ((table *forward-referenced-wrappers*))
                 (with-world-lock ()
                  (let ((classoid (find-classoid name nil)))
                    (or (and classoid (classoid-layout classoid))
-                       (ensure-gethash
-                        name table
-                        (make-layout
-                         (hash-layout-name name)
-                         (or classoid (make-undefined-classoid name))
-                         :depthoid depthoid :inherits inherits
-                         :length length :bitmap bitmap :flags flags))))))))
+                       (let ((wrapper (gethash name table)))
+                         (if wrapper
+                             (wrapper-friend wrapper)
+                             (let ((new (make-layout
+                                         (hash-layout-name name)
+                                         (or classoid (make-undefined-classoid name))
+                                         :depthoid depthoid :inherits inherits
+                                         :length length :bitmap bitmap :flags flags)))
+                               (setf (gethash name table) (layout-friend new))
+                               new)))))))))
          (classoid
           (or (find-classoid name nil) (layout-classoid layout))))
     (if (or (eq (layout-invalid layout) :uninitialized)
@@ -230,7 +233,16 @@ between the ~A definition and the ~A definition"
 ;;;    and subclasses are invalidated, and the SUBCLASSES slot is cleared.
 ;;; -- If DESTRUCT-LAYOUT, then this is some old layout, and is to be
 ;;;    destructively modified to hold the same type information.
-(eval-when (#-sb-xc :compile-toplevel :load-toplevel :execute)
+(macrolet ((set-bitmap-from-layout (to-layout from-layout)
+             `(let ((to-index
+                     (+ (type-dd-length layout)
+                        (calculate-extra-id-words (layout-depthoid ,to-layout))))
+                    (from-index
+                     (+ (type-dd-length layout)
+                        (calculate-extra-id-words (layout-depthoid ,from-layout)))))
+                (dotimes (i (layout-bitmap-words ,from-layout))
+                  (setf (%raw-instance-ref/word ,to-layout (+ to-index i))
+                        (%raw-instance-ref/word ,from-layout (+ from-index i)))))))
 (defun register-layout (layout &key (invalidate t) destruct-layout)
   (declare (type layout layout) (type (or layout null) destruct-layout))
   (with-world-lock ()
@@ -297,9 +309,9 @@ between the ~A definition and the ~A definition"
             (set-layout-inherits destruct-layout inherits t id)
             (set-bitmap-from-layout destruct-layout layout)
             (setf (layout-invalid destruct-layout) nil
-                  (classoid-layout classoid) destruct-layout))
+                  (classoid-wrapper classoid) (layout-friend destruct-layout)))
           (setf (layout-invalid layout) nil
-                (classoid-layout classoid) layout))
+                (classoid-wrapper classoid) (layout-friend layout)))
 
       (dovector (super-layout (layout-inherits layout))
         (let* ((super (layout-classoid super-layout))
@@ -321,8 +333,7 @@ between the ~A definition and the ~A definition"
           (setf (gethash classoid subclasses)
                 (or destruct-layout layout))))))
 
-  (values))
-); EVAL-WHEN
+  (values)))
 
 ;;; Arrange the inherited layouts to appear at their expected depth,
 ;;; ensuring that hierarchical type tests succeed. Layouts with
@@ -476,8 +487,7 @@ between the ~A definition and the ~A definition"
   (defun (setf find-classoid) (new-value name)
     #-sb-xc (declare (type (or null classoid) new-value))
     (aver new-value)
-    (let ((table *forward-referenced-layouts*))
-      (with-world-lock ()
+    (with-world-lock ()
         (let ((cell (find-classoid-cell name :create t)))
           (ecase (info :type :kind name)
             ((nil))
@@ -521,7 +531,7 @@ between the ~A definition and the ~A definition"
              (clear-info :type :expander name)
              (clear-info :type :source-location name)))
 
-          (remhash name table)
+          (remhash name *forward-referenced-wrappers*)
           (%note-type-defined name)
           ;; FIXME: I'm unconvinced of the need to handle either of these.
           ;; Package locks preclude the latter, and in the former case,
@@ -545,7 +555,7 @@ between the ~A definition and the ~A definition"
           (unless (eq (info :type :compiler-layout name)
                       (classoid-layout new-value))
             (setf (info :type :compiler-layout name)
-                  (classoid-layout new-value))))))
+                  (classoid-layout new-value)))))
     new-value)
 
   (defun %clear-classoid (name cell)
@@ -586,14 +596,15 @@ between the ~A definition and the ~A definition"
 (defun insured-find-classoid (name predicate constructor)
   (declare (type function predicate)
            (type (or function symbol) constructor))
-  (let ((table *forward-referenced-layouts*))
+  (let ((table *forward-referenced-wrappers*))
     (with-system-mutex ((hash-table-lock table))
       (let* ((old (find-classoid name nil))
              (res (if (and old (funcall predicate old))
                       old
                       (funcall constructor :name name)))
-             (found (or (gethash name table)
-                        (when old (classoid-layout old)))))
+             (old-wrapper (or (gethash name table)
+                              (when old (classoid-wrapper old))))
+             (found (when old-wrapper (wrapper-friend old-wrapper))))
         (when found
           (setf (layout-classoid found) res))
         (values res found)))))
@@ -1027,6 +1038,12 @@ between the ~A definition and the ~A definition"
       :direct-superclasses (symbol list)
       :prototype-form 'nil)
 
+     (sb-pcl::slot-object
+      :translation (or structure-object standard-object condition)
+      :hierarchical-p nil
+      :state :read-only
+      :prototype-form (make-defstruct-description t 'arbitrary))
+
      ;; KLUDGE: the length must match the subsequent defstruct.
      (pathname :depth 1
                :length ,(+ 7 sb-vm:instance-data-start)
@@ -1199,14 +1216,14 @@ between the ~A definition and the ~A definition"
 ;;; late in the build-order.lisp-expr sequence, and be put in
 ;;; !COLD-INIT-FORMS there?
 (defun !class-finalize ()
-  (dohash ((name layout) *forward-referenced-layouts*)
+  (dohash ((name wrapper) *forward-referenced-wrappers*)
     (let ((class (find-classoid name nil)))
       (cond ((not class)
-             (setf (layout-classoid layout) (make-undefined-classoid name)))
-            ((eq (classoid-layout class) layout)
-             (remhash name *forward-referenced-layouts*))
+             (error "How is there no classoid for ~S ?" name))
+            ((eq (classoid-wrapper class) wrapper)
+             (remhash name *forward-referenced-wrappers*))
             (t
              (error "Something strange with forward layout for ~S:~%  ~S"
-                    name layout))))))
+                    name wrapper))))))
 
 (!defun-from-collected-cold-init-forms !classes-cold-init)

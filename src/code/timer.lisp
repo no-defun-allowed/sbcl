@@ -344,13 +344,10 @@ triggers."
 ;;; win32 waitable timers using a timerfd-like portability layer in
 ;;; the runtime.
 
-#+sb-wtimer
-(define-alien-type wtimer
-    #+win32 system-area-pointer ;HANDLE, but that's not defined yet
-    #+sunos system-area-pointer ;struct os_wtimer *
-    #+(or android linux bsd) int)
+#+win32
+(define-alien-type wtimer system-area-pointer) ;HANDLE, but that's not defined yet
 
-#+sb-wtimer
+#+win32
 (progn
   (define-alien-routine "os_create_wtimer" wtimer)
   (define-alien-routine "os_wait_for_wtimer" int (wt wtimer))
@@ -370,7 +367,7 @@ triggers."
         (prog1
             (setf *waitable-timer-handle* (os-create-wtimer))
           (setf *timer-thread*
-                (sb-thread::make-ephemeral-thread
+                (sb-thread::make-system-thread
                  "System timer watchdog thread"
                  (lambda ()
                    (loop while
@@ -378,7 +375,7 @@ triggers."
                               (os-wait-for-wtimer *waitable-timer-handle*))
                              *waitable-timer-handle*)
                          doing (run-expired-timers)))
-                 nil)))))
+                 nil nil)))))
 
   (defun itimer-emulation-deinit ()
     (with-scheduler-lock ()
@@ -411,7 +408,7 @@ triggers."
               (values 0 min-nsec)
               (values s u))))))
 
-#-(or sb-wtimer win32)
+#+unix
 (progn
   (defun %set-system-timer (sec nsec)
     (sb-unix:unix-setitimer :real 0 0 sec (ceiling nsec 1000)))

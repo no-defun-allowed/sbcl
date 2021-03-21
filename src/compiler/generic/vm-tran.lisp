@@ -188,7 +188,7 @@
   "avoid runtime dispatch on array element type"
   (let* ((type (lvar-type array))
          (element-ctype (array-type-upgraded-element-type type))
-         (declared-element-ctype (array-type-declared-element-type type)))
+         (declared-element-ctype (declared-array-element-type type)))
     (declare (type ctype element-ctype))
     (when (eq *wild-type* element-ctype)
       (give-up-ir1-transform
@@ -207,8 +207,7 @@
                   ((type= element-ctype declared-element-ctype)
                    bare-form)
                   (t
-                   `(the ,(type-specifier declared-element-ctype)
-                         ,bare-form))))))))
+                   (the-unwild declared-element-ctype bare-form))))))))
 
 ;;; Transform multi-dimensional array to one dimensional data vector
 ;;; access.
@@ -282,7 +281,7 @@
   "avoid runtime dispatch on array element type"
   (let* ((type (lvar-type array))
          (element-ctype (array-type-upgraded-element-type type))
-         (declared-element-ctype (array-type-declared-element-type type)))
+         (declared-element-ctype (declared-array-element-type type)))
     (declare (type ctype element-ctype))
     (when (eq *wild-type* element-ctype)
       (give-up-ir1-transform
@@ -294,10 +293,9 @@
                   (type ,element-type-specifier new-value))
          ,(if (type= element-ctype declared-element-ctype)
               '(data-vector-set array index new-value)
-              `(truly-the ,(type-specifier declared-element-ctype)
-                 (data-vector-set array index
-                  (the ,(type-specifier declared-element-ctype)
-                       new-value))))))))
+              (truly-the-unwild declared-element-ctype
+                 `(data-vector-set array index
+                   ,(the-unwild declared-element-ctype 'new-value))))))))
 
 ;;; Transform multi-dimensional array to one dimensional data vector
 ;;; access.

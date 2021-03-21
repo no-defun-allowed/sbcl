@@ -39,7 +39,7 @@ pthread_mutex_t alloc_profiler_lock = PTHREAD_MUTEX_INITIALIZER;
 #endif
 lispobj alloc_code_object (unsigned total_words)
 {
-    struct thread *th = arch_os_get_current_thread();
+    struct thread *th = get_sb_vm_thread();
 #if defined(LISP_FEATURE_X86_64) && !defined(LISP_FEATURE_WIN32)
 #  define REQUIRE_GC_INHIBIT 0
 #else
@@ -58,16 +58,24 @@ lispobj alloc_code_object (unsigned total_words)
     int result = thread_mutex_lock(&code_allocator_lock);
     gc_assert(!result);
     struct code *code = (struct code *)
-      lisp_alloc(&gc_alloc_region[CODE_PAGE_TYPE-1], total_words*N_WORD_BYTES,
-                 CODE_PAGE_TYPE, th);
+      lisp_alloc(&code_region, total_words*N_WORD_BYTES, CODE_PAGE_TYPE, th);
     result = thread_mutex_unlock(&code_allocator_lock);
     gc_assert(!result);
+    THREAD_JIT(0);
 
     code->header = ((uword_t)total_words << CODE_HEADER_SIZE_SHIFT) | CODE_HEADER_WIDETAG;
     code->boxed_size = 0;
     code->debug_info = 0;
     ((lispobj*)code)[total_words-1] = 0; // zeroize the simple-fun table count
+    THREAD_JIT(1);
+
     return make_lispobj(code, OTHER_POINTER_LOWTAG);
+}
+void close_code_region() {
+    __attribute__((unused)) int result = thread_mutex_lock(&code_allocator_lock);
+    gc_assert(!result);
+    ensure_region_closed(&code_region, CODE_PAGE_TYPE);
+    thread_mutex_unlock(&code_allocator_lock);
 }
 #endif
 

@@ -431,10 +431,13 @@
                 ;; It wasn't hung, it just wasn't getting CPU time. For me anyway.
                 (when (search "QEMU" result)
                   .00000001)) ; 10 nanoseconds
+              #+(and darwin arm64)
+               0.01
               0))
          (threads (list*
                    (sb-thread:make-thread (lambda ()
-                                            (loop until stop
+                                            (loop until (progn (sb-thread:barrier (:read))
+                                                               stop)
                                                   do
                                                   (sleep delay-between-gc)
                                                   (gc :full t))))
@@ -442,13 +445,17 @@
                          collect
                          (sb-thread:make-thread
                           (lambda ()
-                            (loop until stop
+                            (loop until (progn (sb-thread:barrier (:read))
+                                               stop)
                                   do (malloc))))))))
-    (loop for time = (get-internal-real-time)
-          for end = (+ time (* internal-time-units-per-second 4)) then end
+    (loop with dot = (get-internal-real-time)
+          with end = (+ dot (* internal-time-units-per-second 4))
+          for time = (get-internal-real-time)
           while (> end time)
           do
-          (when (zerop (mod (- time end) (truncate internal-time-units-per-second 10)))
+          (when (> (- time dot)
+                   (/ internal-time-units-per-second 10))
+            (setf dot time)
             (write-char #\.)
             (finish-output))
           (with-output-to-string (str)
@@ -457,6 +464,7 @@
                          :search t
                          :wait t)))
     (setf stop t)
+    (sb-thread:barrier (:write))
     (mapc #'sb-thread:join-thread threads)))
 
 (with-test (:name (run-program :child-fd-leak)

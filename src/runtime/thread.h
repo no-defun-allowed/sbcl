@@ -15,13 +15,16 @@
 #include "genesis/static-symbols.h"
 
 struct thread_state_word {
+  // - control_stack_guard_page_protected is referenced from
+  //   hand-written assembly code. (grep "THREAD_STATE_WORD_OFFSET")
+  // - sprof_enable is referenced with SAPs.
+  //   (grep "sb-vm:thread-state-word-slot")
   char control_stack_guard_page_protected;
-  char user_thread_p; // opposite of lisp's ephemeral-p
+  char sprof_enable; // statistical CPU profiler switch
   char state;
+  char user_thread_p; // opposite of lisp's ephemeral-p
 #ifdef LISP_FEATURE_64_BIT
-  char padding[5];
-#else
-  char padding[1];
+  char padding[4];
 #endif
 };
 
@@ -79,6 +82,16 @@ struct extra_thread_data
     uint32_t state_not_running_waitcount;
     uint32_t state_not_stopped_waitcount;
 #endif
+#if defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_UNIX
+    // According to https://github.com/adrienverge/openfortivpn/issues/105
+    //   "using GCD semaphore in signal handlers is documented to be unsafe"
+    // which seems almost impossible to believe, considering that sem_t is
+    // documented to be safe, yet the sem_ functions produce a warning:
+    //  warning: 'sem_init' is deprecated [-Wdeprecated-declarations]
+    // So how could there be no signal-safe replacement?
+    os_sem_t sprof_sem;
+#endif
+    int sprof_lock;
 #ifdef LISP_FEATURE_WIN32
     // these are different from the masks that interrupt_data holds
     sigset_t pending_signal_set;
@@ -102,14 +115,8 @@ struct extra_thread_data
 extern struct thread *all_threads;
 extern int dynamic_values_bytes;
 
-#if defined(LISP_FEATURE_DARWIN)
-#define CONTROL_STACK_ALIGNMENT_BYTES 8192 /* darwin wants page-aligned stacks */
-#define THREAD_ALIGNMENT_BYTES CONTROL_STACK_ALIGNMENT_BYTES
-#else
 #define THREAD_ALIGNMENT_BYTES BACKEND_PAGE_BYTES
-#define CONTROL_STACK_ALIGNMENT_BYTES 16
-#endif
-
+#define CONTROL_STACK_ALIGNMENT_BYTES BACKEND_PAGE_BYTES
 
 #ifdef LISP_FEATURE_SB_THREAD
 #define for_each_thread(th) for(th=all_threads;th;th=th->next)
@@ -267,7 +274,7 @@ static inline int calc_altstack_size(struct thread* thread) {
     return (char*)calc_altstack_end(thread) - (char*)calc_altstack_base(thread);
 }
 #if defined(LISP_FEATURE_WIN32)
-static inline struct thread* arch_os_get_current_thread()
+static inline struct thread* get_sb_vm_thread()
     __attribute__((__const__));
 int sb_pthr_kill(struct thread* thread, int signum);
 #endif
@@ -277,7 +284,7 @@ int sb_pthr_kill(struct thread* thread, int signum);
  * much stuff like struct thread and all_threads to be defined, which
  * usually aren't by that time.  So, it's here instead.  Sorry */
 
-static inline struct thread *arch_os_get_current_thread(void)
+static inline struct thread *get_sb_vm_thread(void)
 {
 #if !defined(LISP_FEATURE_SB_THREAD)
      return all_threads;
@@ -342,6 +349,8 @@ inline static int lisp_thread_p(os_context_t __attribute__((unused)) *context) {
 #endif
 }
 
+extern void record_backtrace_from_context(void*,struct thread*);
+
 #if defined(LISP_FEATURE_MACH_EXCEPTION_HANDLER)
 extern kern_return_t mach_lisp_thread_init(struct thread *thread);
 extern void mach_lisp_thread_destroy(struct thread *thread);
@@ -360,17 +369,17 @@ void thread_in_lisp_raised(os_context_t *ctx);
 void thread_interrupted(os_context_t *ctx);
 extern void thread_register_gc_trigger();
 
-# ifdef LISP_FEATURE_SB_THRUPTION
+# ifdef LISP_FEATURE_SB_SAFEPOINT
 void wake_thread(struct thread_instance*),
      wake_thread_impl(struct thread_instance*);
 # endif
 
-#define csp_around_foreign_call(thread) *(((lispobj*)thread) - 1)
+#define csp_around_foreign_call(thread) *(((lispobj*)thread)-(1+THREAD_HEADER_SLOTS))
 
 static inline
 void push_gcing_safety(struct gcing_safety *into)
 {
-    struct thread* th = arch_os_get_current_thread();
+    struct thread* th = get_sb_vm_thread();
     asm volatile ("");
     into->csp_around_foreign_call = csp_around_foreign_call(th);
     csp_around_foreign_call(th) = 0;
@@ -380,7 +389,7 @@ void push_gcing_safety(struct gcing_safety *into)
 static inline
 void pop_gcing_safety(struct gcing_safety *from)
 {
-    struct thread* th = arch_os_get_current_thread();
+    struct thread* th = get_sb_vm_thread();
     asm volatile ("");
     csp_around_foreign_call(th) = from->csp_around_foreign_call;
     asm volatile ("");
@@ -425,4 +434,9 @@ extern int sb_GetTID();
 # define THREAD_ID_VALUE ((void*)thread_self())
 #endif
 
+#ifdef LISP_FEATURE_DARWIN_JIT
+#define THREAD_JIT(x) pthread_jit_write_protect_np((x))
+#else
+#define THREAD_JIT(x)
+#endif
 #endif /* _INCLUDE_THREAD_H_ */

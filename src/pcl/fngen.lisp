@@ -48,19 +48,13 @@
                  (test-converter #'default-test-converter)
                  (code-converter #'default-code-converter)
                  (constant-converter #'default-constant-converter))
-  (function-apply (get-fun-generator lambda test-converter code-converter)
-                  (compute-constants lambda constant-converter)))
-
-(defun get-fun1 (lambda &optional
-                  (test-converter #'default-test-converter)
-                  (code-converter #'default-code-converter)
-                  (constant-converter #'default-constant-converter))
   (values (the function
             (get-fun-generator lambda test-converter code-converter))
           (compute-constants lambda constant-converter)))
 
 (defun default-constantp (form)
-  (constant-typep form '(not (or symbol fixnum cons layout))))
+  (and (constantp form)
+       (not (typep (constant-form-value form) '(or symbol fixnum cons layout)))))
 
 (defun default-test-converter (form)
   (if (default-constantp form)

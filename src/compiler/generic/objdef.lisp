@@ -202,7 +202,8 @@ during backtrace.
               :ref-known (flushable)
               :ref-trans %%code-debug-info
               :set-known ()
-              :set-trans (setf %code-debug-info))
+              :set-trans (setf #-darwin-jit %code-debug-info
+                               #+darwin-jit %%code-debug-info))
   ;; Define this slot if the architecture might ever use fixups.
   ;; x86-64 doesn't necessarily use them, depending on the feature set,
   ;; but this keeps things consistent.
@@ -278,8 +279,7 @@ during backtrace.
                           :widetag funcallable-instance-widetag
                           :alloc-trans %make-funcallable-instance)
   (trampoline :init :funcallable-instance-tramp)
-  #-compact-instance-header (layout :set-trans %set-funcallable-instance-layout
-                                    :ref-trans %fun-layout)
+  #-compact-instance-header (layout :set-trans %set-fun-layout :ref-trans %fun-layout)
   ;; TODO: if we can switch places of 'function' and 'fsc-instance-slots'
   ;; (at least for the builds with compact-instance-header)
   ;; then for both funcallable and non-funcallable instances,
@@ -449,23 +449,23 @@ during backtrace.
 ;;; If we can't do that for some reason - like, say, the safepoint page
 ;;; is located prior to 'struct thread', then these just become ordinary slots.
 (defglobal *thread-header-slot-names*
-  (append '(msan-xor-constant)
+  (append #+x86-64
+          '(t-nil-constants
+            msan-xor-constant
+            ;; The following slot's existence must NOT be conditional on #+msan
+            msan-param-tls) ; = &__msan_param_tls
           #+immobile-space '(function-layout
                              varyobj-space-addr
                              varyobj-card-count
                              varyobj-card-marks)))
 
-#+sb-safepoint
-(defglobal *thread-trailer-slots* (mapcar #'list *thread-header-slot-names*))
-#-sb-safepoint
 (macrolet ((assign-header-slot-indices ()
              (let ((i 0))
                `(progn
                   ,@(mapcar (lambda (x)
                               `(defconstant ,(symbolicate "THREAD-" x "-SLOT") ,(decf i)))
                             *thread-header-slot-names*)))))
-  (assign-header-slot-indices)
-  (defglobal *thread-trailer-slots* nil))
+  (assign-header-slot-indices))
 
 ;;; this isn't actually a lisp object at all, it's a c structure that lives
 ;;; in c-land.  However, we need sight of so many parts of it from Lisp that
@@ -487,11 +487,7 @@ during backtrace.
   ;; Furthermore, it is technically possibly for a pthread_t to be smaller than a word
   ;; (a 4-byte identifier, not a pointer, on 64-bit) but that seems not to be true
   ;; for any system that we care about.
-  ;;
-  ;; And this slot is badly named, it should be "Pthread" since it's the POSIX
-  ;; (or emulated POSIX) thread object, not necessarily the OS's thread notion.
-  ;;
-  (os-thread :c-type #+(or win32 (not sb-thread)) "lispobj"
+  (os-thread :c-type #+(or win32 (not sb-thread)) "lispobj" ; actually is HANDLE
                      #-(or win32 (not sb-thread)) "pthread_t")
 
   ;; Keep this first bunch of slots from binding-stack-pointer through alloc-region
@@ -512,8 +508,6 @@ during backtrace.
   (alien-stack-pointer :c-type "lispobj *" :pointer t
                        :special *alien-stack-pointer*)
   (stepping)
-  ;; The following slot's existence must NOT be conditional on #+msan
-  #+x86-64 (msan-param-tls) ; = &__msan_param_tls
   (dynspace-addr)
   (dynspace-card-count)
   (dynspace-pte-base)
@@ -547,6 +541,8 @@ during backtrace.
   ;; a struct containing {starting, running, suspended, dead}
   ;; and some other state fields.
   (state-word :c-type "struct thread_state_word")
+  ;; Statistical CPU profiler data recording buffer
+  (sprof-data)
 
   #+x86 (tls-cookie)                          ;  LDT index
   #+sb-thread (tls-size)
@@ -566,10 +562,6 @@ during backtrace.
   (control-stack-pointer :c-type "lispobj *")
   #+mach-exception-handler
   (mach-port-name :c-type "mach_port_name_t")
-  ;; If we need the header slots, but they can't precede this structure
-  ;; for technical reasons having to do with no writable memory being there,
-  ;; then stuff them at the end, for lack of any place better.
-  ,@*thread-trailer-slots*
   ;; The *current-thread* MUST be the last slot in the C thread structure.
   ;; It it the only slot that needs to be noticed by the garbage collector.
   (lisp-thread :pointer t :special sb-thread:*current-thread*))

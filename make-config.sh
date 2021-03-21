@@ -562,6 +562,9 @@ case "$sbcl_os" in
 	        printf ' :inode64' >> $ltf
             fi
         fi
+        if [ $sbcl_arch = "arm64" ]; then
+            printf ' :darwin-jit' >> $ltf
+        fi
         link_or_copy $sbcl_arch-darwin-os.h target-arch-os.h
         link_or_copy bsd-os.h target-os.h
         link_or_copy Config.$sbcl_arch-darwin Config
@@ -589,8 +592,7 @@ case "$sbcl_os" in
         # (Of course it doesn't provide dlopen, but there is
         # roughly-equivalent magic nevertheless:)
         printf ' :os-provides-dlopen' >> $ltf
-        printf ' :sb-thread :sb-safepoint :sb-thruption :sb-wtimer' >> $ltf
-        printf ' :sb-safepoint-strictly' >> $ltf
+        printf ' :sb-thread :sb-safepoint' >> $ltf
         #
         link_or_copy Config.$sbcl_arch-win32 Config
         link_or_copy $sbcl_arch-win32-os.h target-arch-os.h

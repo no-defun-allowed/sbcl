@@ -103,6 +103,15 @@
 (defconstant +string-stream-layout-flag+     #b01000000)
 (defconstant +stream-layout-flag+            #b10000000)
 
+;;; the type of LAYOUT-DEPTHOID and LAYOUT-LENGTH values.
+;;; Each occupies two bytes of the %BITS slot when possible,
+;;; otherwise a slot unto itself.
+(def!type layout-depthoid () '(integer -1 #x7FFF))
+(def!type layout-length () '(integer 0 #xFFFF))
+(def!type layout-bitmap () 'integer)
+;;; ID must be an fixnum for either value of n-word-bits.
+(def!type layout-id () '(signed-byte 30))
+
 ;;; The LAYOUT structure is pointed to by the first cell of instance
 ;;; (or structure) objects. It represents what we need to know for
 ;;; type checking and garbage collection. Whenever a class is
@@ -138,6 +147,8 @@
 
 ;;; 32-bit is not done yet. Three slots are still used, instead of two.
 
+#-metaspace
+(progn
 (sb-xc:defstruct (layout (:copier nil)
                          ;; Parsing DEFSTRUCT uses a temporary layout
                          (:constructor make-temporary-layout
@@ -209,7 +220,68 @@
   #-64-bit (id-word3 0 :type word)
   #-64-bit (id-word4 0 :type word)
   #-64-bit (id-word5 0 :type word))
-(declaim (freeze-type layout))
+(declaim (freeze-type layout)))
+
+#+metaspace
+(progn
+;;; Separating the pointer and nonpointer slots of LAYOUT satisfies the
+;;; requirement of a certain garbage collector (WIP), but also opens up the
+;;; possibility of absorbing at least one of the vectorish slots into the
+;;; WRAPPER since it could be reallocated with variable size.
+;;; The SLOT-TABLE slot might be a good candidate for trailing tagged slots.
+(sb-xc:defstruct (wrapper (:copier nil) (:constructor %make-wrapper))
+  (clos-hash (missing-arg) :type (and fixnum unsigned-byte)) ; redundant
+  (classoid (missing-arg) :type classoid)
+  (inherits #() :type simple-vector)
+  (equalp-impl #'equalp-err :type (sfunction (t t) boolean) :read-only t)
+  (slot-table #(1 nil) :type simple-vector)
+  (%info nil :type (or list defstruct-description))
+  (invalid :uninitialized :type (or cons (member nil t :uninitialized)))
+  (friend nil :type layout))
+;;; See LAYOUT for the remarks about each slot.
+;;; LAYOUT points to WRAPPER and vice-versa.
+;;; The most common LAYOUT is 8 words.
+;;; Needing >64 words would be quite unusual - the layout would have
+;;; an enormous depthoid or bitmap or both.
+(sb-xc:defstruct (layout (:copier nil)
+                         ;; Parsing DEFSTRUCT uses a temporary layout
+                         (:constructor %make-temporary-layout (friend clos-hash)))
+  ;; !!! The FRIEND slot in LAYOUT *MUST* BE FIRST !!!
+  (friend nil :type wrapper)
+  (clos-hash (missing-arg) :type (and fixnum unsigned-byte))
+  (flags 0 :type (signed-byte #.sb-vm:n-word-bits))
+  (id-word0 0 :type word)
+  (id-word1 0 :type word)
+  (id-word2 0 :type word)
+  ;; There are zero or more raw words if a type needs to store additional layout-ids,
+  ;; and there are one or more raw words for the GC bitmap.
+  )
+(declaim (freeze-type wrapper layout))
+
+#-sb-xc-host
+(progn
+(defmacro layout-classoid (layout) `(wrapper-classoid (layout-friend ,layout)))
+(defmacro layout-slot-table (layout) `(wrapper-slot-table (layout-friend ,layout)))
+(defmacro layout-%info (layout) `(wrapper-%info (layout-friend ,layout)))
+(defmacro layout-equalp-impl (layout) `(wrapper-equalp-impl (layout-friend ,layout)))
+(defun layout-inherits (layout) (wrapper-inherits (layout-friend layout)))
+(declaim (inline layout-invalid))
+(defun layout-invalid (layout)
+  (wrapper-invalid (layout-friend layout)))
+(defun (setf layout-invalid) (newval layout)
+  (setf (wrapper-invalid (layout-friend layout)) newval))
+(defun make-temporary-layout (clos-hash classoid inherits)
+  (let* ((wrapper (%make-wrapper :clos-hash clos-hash :classoid classoid
+                                 :inherits inherits :invalid nil
+                                 :friend #.(find-layout t)))
+         (layout (%make-temporary-layout wrapper clos-hash)))
+    (setf (wrapper-friend wrapper) layout)
+    layout))))
+
+#+(and (not metaspace) (not sb-xc-host))
+(progn (defmacro layout-friend (x) x)
+       (defmacro wrapper-friend (x) x)
+       (defmacro wrapper-%info (x) `(layout-%info ,x)))
 
 ;;; The cross-compiler representation of a LAYOUT omits several things:
 ;;;   * BITMAP - obtainable via (DD-BITMAP (LAYOUT-INFO layout)).
@@ -223,6 +295,10 @@
 ;;; various type checks.
 #+sb-xc-host
 (progn
+  ;; As far as the host is concerned, LAYOUT and WRAPPER are always the same.
+  ;; We need this deftype because of the DEF!STRUCT for CLASSOID which states
+  ;; that the type of the slot named WRAPPER is WRAPPER.
+  #+metaspace (deftype wrapper () 'layout)
   (defstruct (layout (:include structure!object)
                      (:constructor host-make-layout
                                    (clos-hash classoid &key id info depthoid inherits
@@ -270,17 +346,20 @@
   (dsd-index (find slot-name
                    (dd-slots (find-defstruct-description type-name))
                    :key #'dsd-name)))
-(defconstant structure-object-layout-id 2) ; KLUDGE
+
 #-sb-xc-host
 (defun layout-id (layout)
-  (let ((depthoid (layout-depthoid layout)))
+  ;; If a structure type at depthoid >= 2, then fetch the INDEXth id
+  ;; where INDEX is depthoid - 2. Otherwise fetch the 0th id.
+  ;; There are a few non-structure types at positive depthoid; those do not store
+  ;; their ancestors in the vector; they only store self-id at index 0.
+  ;; This isn't performance-critical. If it were, then we should store self-ID
+  ;; at a fixed index. Using it for type-based dispatch remains a possibility.
+  (let* ((depth (- (layout-depthoid layout) 2))
+         (index (if (or (< depth 0) (not (logtest (layout-flags layout)
+                                                  +structure-layout-flag+)))
+                    0 depth)))
     (truly-the layout-id
-     (cond ((not (logtest (layout-flags layout) +structure-layout-flag+))
-            ;; the 0th word of the ID vector stores the layout id
-            (layout-id-word0 layout))
-           ((>= depthoid 2)
-            ;; Depthoid 2 is in the 0th index and so on.
-            (let ((index (- depthoid 2)))
               #-64-bit
               (%raw-instance-ref/signed-word
                layout (+ (get-dsd-index layout id-word0) index))
@@ -291,9 +370,7 @@
                                             (get-dsd-index layout id-word0))
                                          sb-vm:word-shift)
                                     sb-vm:instance-pointer-lowtag))))
-                  (signed-sap-ref-32 sap (ash index 2))))))
-           (t ; KLUDGE: must be STRUCTURE-OBJECT
-            structure-object-layout-id)))))
+                  (signed-sap-ref-32 sap (ash index 2)))))))
 
 ;;; Applicable only if bit-packed (for 64-bit architectures)
 (defmacro pack-layout-flags (depthoid length flags)
@@ -312,43 +389,6 @@
   ;; 0 and 1 for T and STRUCTURE-OBJECT respectively are not stored.
   `(ceiling (max 0 (- ,depthoid ,layout-id-vector-fixed-capacity))
             ,(/ sb-vm:n-word-bytes 4)))
-
-(defun set-layout-inherits (layout inherits structurep this-id)
-  (declare (ignorable structurep this-id))
-  (setf (layout-inherits layout) inherits)
-  ;;; If structurep, and *only* if, store all the inherited layout IDs.
-  ;;; It looks enticing to try to always store "something", but that goes wrong,
-  ;;; because only structure-object layouts are growable, and only structure-object
-  ;;; can store the self-ID in the proper index.
-  ;;; If the depthoid is -1, the self-ID has to go in index 0.
-  ;;; Standard-object layouts are not growable. The inherited layouts are known
-  ;;; only at class finalization time, at which point we've already made the layout.
-  ;;; Hence, the required indirection to the simple-vector of inherits.
-  #-sb-xc-host
-  (cond (structurep
-         (with-pinned-objects (layout)
-           (loop with sap = (sap+ (int-sap (get-lisp-obj-address layout))
-                                  (- (ash (+ sb-vm:instance-slots-offset
-                                             (get-dsd-index layout id-word0))
-                                          sb-vm:word-shift)
-                                     sb-vm:instance-pointer-lowtag))
-                 for i from 0 by 4
-                 for j from 2 below (length inherits)
-                 do (setf (signed-sap-ref-32 sap i) (layout-id (svref inherits j)))
-                 finally (setf (signed-sap-ref-32 sap i) this-id))))
-        ((not (eql this-id 0))
-         (setf (layout-id-word0 layout) this-id))))
-
-(defmacro set-bitmap-from-layout (to-layout from-layout)
-  #+sb-xc-host (declare (ignore to-layout from-layout))
-  #-sb-xc-host
-  `(let ((to-index (+ (type-dd-length layout)
-                      (calculate-extra-id-words (layout-depthoid ,to-layout))))
-         (from-index (+ (type-dd-length layout)
-                      (calculate-extra-id-words (layout-depthoid ,from-layout)))))
-     (dotimes (i (layout-bitmap-words ,from-layout))
-       (setf (%raw-instance-ref/word ,to-layout (+ to-index i))
-             (%raw-instance-ref/word ,from-layout (+ from-index i))))))
 
 ;;; See the pictures above DD-BITMAP in src/code/defstruct for the details.
 (defconstant standard-gf-primitive-obj-layout-bitmap
@@ -372,25 +412,17 @@
 ;;; The third one also gets thrown away.
 #-sb-xc-host
 (progn
-(declaim (inline layout-dd layout-info layout-slot-list))
+(declaim (inline layout-dd layout-info))
 ;; Use LAYOUT-DD to read LAYOUT-INFO if you want to assert that it is non-nil.
 (defun layout-dd (layout)
   (the defstruct-description (layout-%info layout)))
 (defun layout-info (layout)
   (let ((info (layout-%info layout)))
     (if (%instancep info) info)))
-(defun layout-slot-list (layout)
-  (let ((info (layout-%info layout)))
-    (if (listp info) info)))
 (defun (setf layout-info) (newval layout)
   ;; The current value must be nil or a defstruct-description,
   ;; otherwise we'd clobber a non-nil slot list.
   (aver (not (consp (layout-%info layout))))
-  (setf (layout-%info layout) newval))
-(defun (setf layout-slot-list) (newval layout)
-  ;; The current value must be a list, otherwise we'd clobber
-  ;; a defstruct-description.
-  (aver (listp (layout-%info layout)))
   (setf (layout-%info layout) newval))
 
 (define-load-time-global *layout-id-generator* (cons 0 nil))
@@ -420,6 +452,11 @@
                           sb-vm:instance-widetag))
                  #-immobile-space (%make-instance nwords))))
     (setf (%instance-layout layout) #.(find-layout 'layout))
+    #+metaspace
+    (let ((wrapper (%make-wrapper :clos-hash clos-hash :classoid classoid  :%info info
+                                  :inherits inherits :invalid invalid
+                                  :friend layout)))
+      (setf (layout-friend layout) wrapper))
     (setf (layout-flags layout) #+64-bit (pack-layout-flags depthoid length flags)
                                 #-64-bit flags)
     (setf (layout-clos-hash layout) clos-hash
@@ -433,13 +470,13 @@
       (dotimes (i bitmap-words)
         (setf (%raw-instance-ref/word layout (+ bitmap-base i))
               (ldb (byte sb-vm:n-word-bits (* i sb-vm:n-word-bits)) bitmap))))
-    (setf (layout-invalid layout) invalid)
     ;; It's not terribly important that we recycle layout IDs, but I have some other
     ;; changes planned that warrant a finalizer per layout.
     (unless (built-in-classoid-p classoid)
       (finalize layout (lambda () (atomic-push id (cdr *layout-id-generator*)))
                 :dont-save t))
     layout))
+
 (declaim (inline layout-bitmap-words))
 (defun layout-bitmap-words (layout)
   (declare (layout layout))
@@ -510,8 +547,11 @@
              #-sb-xc-host (:pure nil))
   ;; the value to be returned by CLASSOID-NAME.
   (name nil :type symbol)
-  ;; the current layout for this class, or NIL if none assigned yet
-  (layout nil :type (or layout null))
+  ;; the current WRAPPER, or LAYOUT, for this classoid,
+  ;; or NIL if none assigned yet.
+  ;; The name of the slot is always WRAPPER even when WRAPPER = LAYOUT.
+  ;; See doc/internals-notes/metaspace for further details.
+  (wrapper nil :type (or null #+metaspace wrapper #-metaspace layout))
   ;; How sure are we that this class won't be redefined?
   ;;   :READ-ONLY = We are committed to not changing the effective
   ;;                slots or superclasses.
@@ -533,6 +573,14 @@
   ;; we don't just call it the CLASS slot) object for this class, or
   ;; NIL if none assigned yet
   (pcl-class nil))
+
+;; XC version is defined in cross-misc
+#-sb-xc-host
+(progn
+  (declaim (inline classoid-layout))
+  (defun classoid-layout (classoid)
+    #-metaspace (classoid-wrapper classoid)
+    #+metaspace (awhen (classoid-wrapper classoid) (wrapper-friend it))))
 
 (defun layout-classoid-name (x)
   (classoid-name (layout-classoid x)))

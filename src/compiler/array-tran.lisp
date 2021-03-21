@@ -31,6 +31,10 @@
 ;;; known supertype of the upgraded-array-element-type, if if the exact
 ;;; U-A-E-T is not known. (If it is NIL, the primary return value is as good
 ;;; as it gets.)
+;;; FIXME: poorly named, it sounds like an accessor on an instance of ARRAY-TYPE,
+;;; but unfortunately UPGRADED-ARRAY-ELEMENT-TYPE is a CL: symbol
+;;; and %UPGRADED-ARRAY-ELEMENT-TYPE is already a thing as well.
+;;; Perhaps ARRAY-IMPLIED-ELEMENT-TYPE would be less misleading?
 (defun array-type-upgraded-element-type (type)
   (typecase type
     ;; Note that this IF mightn't be satisfied even if the runtime
@@ -109,7 +113,7 @@
      ;; 2002-08-21
      (values *wild-type* nil))))
 
-(defun array-type-declared-element-type (type)
+(defun declared-array-element-type (type)
   (if (array-type-p type)
       (array-type-element-type type)
       *wild-type*))
@@ -346,11 +350,10 @@
                           node))
 
 (defoptimizer (make-array-header* derive-type) ((&rest inits))
-  (let* ((data-position #.(sb-vm:slot-offset
-                           (find 'sb-vm::data (sb-vm:primitive-object-slots
-                                               (find 'array sb-vm:*primitive-objects*
-                                                     :key 'sb-vm:primitive-object-name))
-                                 :key 'sb-vm:slot-name)))
+  (let* ((data-position
+          #.(sb-vm:slot-offset
+             (sb-vm::primitive-object-slot (sb-vm::primitive-object 'array)
+                                           'sb-vm::data)))
          (data (nth data-position inits))
          (type (lvar-type data)))
     (when (array-type-p type)
@@ -753,7 +756,8 @@
                    `(truly-the ,type-spec ,array))))
            (with-alloc-form (&optional data-wrapper)
              (cond (complex
-                    (let* ((constant-fill-pointer-p (constant-lvar-p fill-pointer))
+                    (let* ((constant-fill-pointer-p (and fill-pointer
+                                                         (constant-lvar-p fill-pointer)))
                            (fill-pointer-value (and constant-fill-pointer-p
                                                     (lvar-value fill-pointer)))
                            (length-expr
@@ -1059,7 +1063,8 @@
       (give-up-ir1-transform
        "The dimension list is not constant; cannot open code array creation."))
     (let ((dims (lvar-value dims))
-          (element-type-ctype (and (constant-lvar-p element-type)
+          (element-type-ctype (and element-type
+                                   (constant-lvar-p element-type)
                                    (ir1-transform-specifier-type
                                     (lvar-value element-type)))))
       (when (or (contains-unknown-type-p element-type-ctype)
@@ -1665,6 +1670,11 @@
   (define-frob schar %scharset simple-string)
   (define-frob char %charset string))
 
+(defun the-unwild (type expr)
+  (if (or (null type) (eq type *wild-type*)) expr `(the ,type ,expr)))
+(defun truly-the-unwild (type expr)
+  (if (or (null type) (eq type *wild-type*)) expr `(truly-the ,type ,expr)))
+
 ;;; We transform SVREF and %SVSET directly into DATA-VECTOR-REF/SET: this is
 ;;; around 100 times faster than going through the general-purpose AREF
 ;;; transform which ends up doing a lot of work -- and introducing many
@@ -1674,35 +1684,30 @@
 ;;; FIXME: [S]CHAR, and [S]BIT above would almost certainly benefit from a similar
 ;;; treatment.
 (define-source-transform svref (vector index)
-  (let ((elt-type (or (when (symbolp vector)
-                        (let ((var (lexenv-find vector vars)))
-                          (when (lambda-var-p var)
-                            (type-specifier
-                             (array-type-declared-element-type (lambda-var-type var))))))
-                      t)))
+  (let ((elt-type (let ((var (and (symbolp vector) (lexenv-find vector vars))))
+                    (when (lambda-var-p var)
+                      (declared-array-element-type (lambda-var-type var))))))
     (with-unique-names (n-vector)
       `(let ((,n-vector ,vector))
-         (the ,elt-type (data-vector-ref
+         ,(the-unwild elt-type `(data-vector-ref
                          (the simple-vector ,n-vector)
                          (check-bound ,n-vector (length ,n-vector) ,index)))))))
 
 (define-source-transform %svset (vector index value)
-  (let ((elt-type (or (when (symbolp vector)
-                        (let ((var (lexenv-find vector vars)))
-                          (when (lambda-var-p var)
-                            (type-specifier
-                             (array-type-declared-element-type (lambda-var-type var))))))
-                      t)))
+  (let ((elt-type (let ((var (and (symbolp vector) (lexenv-find vector vars))))
+                    (when (lambda-var-p var)
+                      (declared-array-element-type (lambda-var-type var))))))
     (with-unique-names (n-vector)
       `(let ((,n-vector ,vector))
-         (truly-the ,elt-type (data-vector-set
+         ,(truly-the-unwild elt-type
+                             `(data-vector-set
                                (the simple-vector
                                     (with-annotations
                                         (,(make-lvar-modified-annotation :caller
                                                                          '(setf svref)))
                                       ,n-vector))
                                (check-bound ,n-vector (length ,n-vector) ,index)
-                               (the ,elt-type ,value)))))))
+                               ,(the-unwild elt-type value)))))))
 
 (macrolet (;; This is a handy macro for computing the row-major index
            ;; given a set of indices. We wrap each index with a call
@@ -1778,13 +1783,13 @@
             (null (array-type-complexp type))
             (neq element-ctype *wild-type*)
             (eql (length (array-type-dimensions type)) 1))
-       (let* ((declared-element-ctype (array-type-declared-element-type type))
+       (let* ((declared-element-ctype (array-type-element-type type))
               (bare-form
                 `(data-vector-ref array
                                   (check-bound array (array-dimension array 0) index))))
          (if (type= declared-element-ctype element-ctype)
              bare-form
-             `(the ,(type-specifier declared-element-ctype) ,bare-form))))
+             `(the ,declared-element-ctype ,bare-form))))
       ((policy node (zerop insert-array-bounds-checks))
        `(hairy-data-vector-ref array index))
       (t `(hairy-data-vector-ref/check-bounds array index)))))
@@ -1797,13 +1802,11 @@
 ;;; But if we find out later that there's some useful type information
 ;;; available, switch back to the normal one to give other transforms
 ;;; a stab at it.
-(macrolet ((define (name transform-to extra extra-type)
-             (declare (ignore extra-type))
-             `(deftransform ,name ((array index ,@extra))
+(macrolet ((define (name args expr)
+             `(deftransform ,name ,args
                 (let* ((type (lvar-type array))
                        (element-type (array-type-upgraded-element-type type))
-                       (declared-type (type-specifier
-                                       (array-type-declared-element-type type))))
+                       (declared-type (declared-array-element-type type)))
                   ;; If an element type has been declared, we want to
                   ;; use that information it for type checking (even
                   ;; if the access can't be optimized due to the array
@@ -1819,22 +1822,17 @@
                               (not (null (array-type-complexp type))))
                       (give-up-ir1-transform
                        "Upgraded element type of array is not known at compile time.")))
-                  ,(if extra
-                       ``(truly-the ,declared-type
-                                    (,',transform-to array
-                                                     (check-bound array
-                                                                  (array-dimension array 0)
-                                                                  index)
-                                                     (the ,declared-type ,@',extra)))
-                       ``(the ,declared-type
-                           (,',transform-to array
-                                            (check-bound array
-                                                         (array-dimension array 0)
-                                                         index))))))))
-  (define hairy-data-vector-ref/check-bounds
-      hairy-data-vector-ref nil nil)
-  (define hairy-data-vector-set/check-bounds
-      hairy-data-vector-set (new-value) (*)))
+                  ,expr))))
+  (define hairy-data-vector-ref/check-bounds ((array index))
+    (the-unwild declared-type
+          `(hairy-data-vector-ref
+           array (check-bound array (array-dimension array 0) index))))
+  (define hairy-data-vector-set/check-bounds ((array index new-value))
+    (truly-the-unwild declared-type
+                `(hairy-data-vector-set
+                 array
+                 (check-bound array (array-dimension array 0) index)
+                 ,(the-unwild declared-type 'new-value)))))
 
 ;;; Just convert into a HAIRY-DATA-VECTOR-REF (or
 ;;; HAIRY-DATA-VECTOR-SET) after checking that the index is inside the

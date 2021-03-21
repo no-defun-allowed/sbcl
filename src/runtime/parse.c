@@ -16,7 +16,7 @@
 #include <ctype.h>
 
 #include "sbcl.h"
-#if defined(LISP_FEATURE_WIN32) && defined(LISP_FEATURE_SB_THREAD)
+#ifdef LISP_FEATURE_WIN32
 #include "pthreads_win32.h"
 #else
 #include <signal.h>
@@ -264,7 +264,7 @@ static int parse_regnum(char *s)
 
 int parse_lispobj(char **ptr, lispobj *output)
 {
-    struct thread *thread=arch_os_get_current_thread();
+    struct thread *thread=get_sb_vm_thread();
     char *token = parse_token(ptr);
     uword_t pointer;
     lispobj result;

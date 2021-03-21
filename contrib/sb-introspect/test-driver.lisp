@@ -28,15 +28,23 @@
 
 (deftest function-lambda-list.1
     (function-lambda-list 'cl-user::one)
-  (cl-user::a cl-user::b cl-user::c))
+  (cl-user::a cl-user::b cl-user::c)
+  nil)
+
+(deftest function-lambda-list.1a
+    (function-lambda-list 'cl-user::0-debug)
+  ()
+  t)
 
 (deftest function-lambda-list.2
     (function-lambda-list 'the)
-  (sb-c::value-type sb-c::form))
+  (sb-c::value-type sb-c::form)
+  nil)
 
 (deftest function-lambda-list.3
     (function-lambda-list #'(sb-pcl::slow-method cl-user::j (t)))
-  (sb-pcl::method-args sb-pcl::next-methods))
+  (sb-pcl::method-args sb-pcl::next-methods)
+  nil)
 
 (deftest macro-lambda-list.1
     (equal (function-lambda-list (defmacro macro-lambda-list.1-m (x b)
@@ -319,6 +327,23 @@
     (deftype-lambda-list 'vector)
   (&optional sb-kernel::element-type sb-kernel::size)
   t)
+
+;;; Check correctness of METHOD-COMBINATION-LAMBDA-LIST
+(deftest method-combination-lambda-list.1
+    (method-combination-lambda-list 'standard)
+  nil)
+
+(deftest method-combination-lambda-list.2
+    (method-combination-lambda-list
+     (sb-mop:find-method-combination #'documentation 'cl-user::r nil))
+  (&optional (sb-pcl::order :most-specific-first)))
+
+(define-method-combination long-form-mc (foo &rest args &key bar) ())
+
+(deftest method-combination-lambda-list.3
+    (method-combination-lambda-list 'long-form-mc)
+  (foo &rest args &key bar))
+
 
 ;;; Test allocation-information
 

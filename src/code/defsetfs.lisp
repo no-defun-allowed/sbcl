@@ -51,7 +51,7 @@
 (defsetf %funcallable-instance-info %set-funcallable-instance-info)
 ;;; The writer is named after the reader, but only operates on FUNCALLABLE-INSTANCE
 ;;; even if the reader operates on any FUNCTION.
-(defsetf %fun-layout %set-funcallable-instance-layout)
+(defsetf %fun-layout %set-fun-layout)
 
 ;;; from early-setf.lisp
 
@@ -335,18 +335,19 @@ place with bits from the low-order end of the new value."
 (eval-when (:compile-toplevel :load-toplevel :execute)
   (%defsetf 'truly-the (info :setf :expander 'the))
   (%defsetf 'the* (info :setf :expander 'the))
-
-  (%defsetf 'mask-field (info :setf :expander 'ldb)
-            "The first argument is a byte specifier. The second is any place form
+  (%defsetf 'mask-field
+              (lambda (&rest args)
+              "The first argument is a byte specifier. The second is any place form
 acceptable to SETF. Replaces the specified byte of the number in this place
-with bits from the corresponding position in the new value.")
+with bits from the corresponding position in the new value."
+              (apply (info :setf :expander 'ldb) args)))
 
 ;;; SETF of LOGBITP is not mandated by CLHS but is nice to have.
 ;;; FIXME: the code is suboptimal. Better code would "pre-shift" the 1 bit,
 ;;; so that result = (in & ~mask) | (flag ? mask : 0)
 ;;; Additionally (setf (logbitp N x) t) is extremely stupid- it first clears
 ;;; and then sets the bit, though it does manage to pre-shift the constants.
-   (%defsetf 'logbitp (info :setf :expander 'ldb))))
+  (%defsetf 'logbitp (info :setf :expander 'ldb))))
 
 ;;; Rather than have a bunch of SB-PCL::FAST-METHOD function names all point
 ;;; to one that is randomly chosen - and therefore looks confusing -

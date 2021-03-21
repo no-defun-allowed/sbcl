@@ -74,7 +74,7 @@ os_zero(os_vm_address_t addr, os_vm_size_t length)
          * zero-filled. */
 
         os_invalidate(block_start, block_size);
-        addr = os_validate(NOT_MOVABLE, block_start, block_size);
+        addr = os_validate(NOT_MOVABLE, block_start, block_size, 0, 0);
 
         if (addr == NULL || addr != block_start)
             lose("os_zero: block moved! %p ==> %p", block_start, addr);
@@ -82,10 +82,49 @@ os_zero(os_vm_address_t addr, os_vm_size_t length)
 }
 #endif
 
+#ifdef LISP_FEATURE_USE_SYS_MMAP
+///
+///                **********************************
+///                *  GC MUST NOT ACQUIRE ANY LOCKS *
+///                **********************************
+///
+/// It's normally fine to use the mmap() system call to obtain memory for the
+/// hopscotch tables, unless your C runtime intercepts mmap() and causes it
+/// to sometimes (or always?) need a spinlock. That lock may be owned already,
+/// so GC will patiently wait forever; meanwhile the lock owner is also
+/// waiting forever on GC to finish.
+/// So bypass the C library routine and call the OS directly
+/// in case of a non-signal-safe interceptor such as
+///   https://chromium.googlesource.com/chromium/src/third_party/tcmalloc/chromium/+/refs/heads/master/src/malloc_hook_mmap_linux.h#146
+///
+static inline void* sys_mmap(void* addr, size_t length, int prot, int flags,
+                             int fd, off_t offset) {
+    // "linux-os.h" brings in <syscall.h>, others may need something different.
+    // mmap2 allows large file access with 32-bit off_t. We don't care about that,
+    // but _usually_ only one or the other of the syscalls exists depending on,
+    // various factors. Basing it on word size will pick the right one.
+#ifdef LISP_FEATURE_64_BIT
+    return (void*)syscall(SYS_mmap, addr, length, prot, flags, fd, offset);
+#else
+    return (void*)syscall(SYS_mmap2, addr, length, prot, flags, fd, offset);
+#endif
+}
+static inline int sys_munmap(void* addr, size_t length) {
+    return syscall(__NR_munmap, addr, length);
+}
+os_vm_address_t os_allocate(os_vm_size_t len) {
+    void* answer = sys_mmap(0, len, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, 0, 0);
+    if (answer == MAP_FAILED) return 0;
+    return answer;
+}
+void os_deallocate(os_vm_address_t addr, os_vm_size_t len) {
+    sys_munmap(addr, len);
+}
+#else
 os_vm_address_t
 os_allocate(os_vm_size_t len)
 {
-    return os_validate(MOVABLE, (os_vm_address_t)NULL, len);
+    return os_validate(MOVABLE, (os_vm_address_t)NULL, len, 0, 0);
 }
 
 void
@@ -93,6 +132,7 @@ os_deallocate(os_vm_address_t addr, os_vm_size_t len)
 {
     os_invalidate(addr,len);
 }
+#endif
 
 int
 os_get_errno(void)
@@ -100,9 +140,7 @@ os_get_errno(void)
     return errno;
 }
 
-#if defined LISP_FEATURE_SB_THREAD && !defined LISP_FEATURE_SB_SAFEPOINT \
-  && !defined CANNOT_USE_POSIX_SEM_T
-
+#if defined LISP_FEATURE_SB_THREAD && defined LISP_FEATURE_UNIX && !defined USE_DARWIN_GCD_SEMAPHORES
 void
 os_sem_init(os_sem_t *sem, unsigned int value)
 {
@@ -209,6 +247,9 @@ gc_managed_heap_space_p(lispobj addr)
         || (DYNAMIC_1_SPACE_START <= addr &&
             addr < DYNAMIC_1_SPACE_START + dynamic_space_size)
 #endif
+#ifdef LISP_FEATURE_DARWIN_JIT
+        || (STATIC_CODE_SPACE_START <= addr && addr < STATIC_CODE_SPACE_END)
+#endif
         )
         return 1;
     return 0;
@@ -218,7 +259,8 @@ gc_managed_heap_space_p(lispobj addr)
 
 /* Remap a part of an already existing memory mapping from a file,
  * and/or create a new mapping as need be */
-void* load_core_bytes(int fd, os_vm_offset_t offset, os_vm_address_t addr, os_vm_size_t len)
+void* load_core_bytes(int fd, os_vm_offset_t offset, os_vm_address_t addr, os_vm_size_t len,
+                      int __attribute__((unused)) execute)
 {
     int fail = 0;
     os_vm_address_t actual;
@@ -228,7 +270,11 @@ void* load_core_bytes(int fd, os_vm_offset_t offset, os_vm_address_t addr, os_vm
                   // However, the addr=0 case is for 'editcore' which unfortunately _does_
                   // write the memory. I'd prefer that it not,
                   // but that's not the concern here.
+#ifdef LISP_FEATURE_DARWIN_JIT
+                  OS_VM_PROT_READ | (execute ?  OS_VM_PROT_EXECUTE : OS_VM_PROT_WRITE),
+#else
                   addr ? OS_VM_PROT_ALL : OS_VM_PROT_READ | OS_VM_PROT_WRITE,
+#endif
                   // Do not pass MAP_FIXED with addr of 0, because most OSes disallow that.
                   MAP_PRIVATE | (addr ? MAP_FIXED : 0),
                   fd, (off_t) offset);
@@ -242,6 +288,32 @@ void* load_core_bytes(int fd, os_vm_offset_t offset, os_vm_address_t addr, os_vm
         lose("load_core_bytes(%d,%zx,%p,%zx) failed", fd, offset, addr, len);
     return (void*)actual;
 }
+
+#ifdef LISP_FEATURE_DARWIN_JIT
+void* load_core_bytes_jit(int fd, os_vm_offset_t offset, os_vm_address_t addr, os_vm_size_t len)
+{
+    ssize_t count;
+
+    lseek(fd, offset, SEEK_SET);
+
+    char* buf = malloc(65536);
+
+    while (len) {
+        count = read(fd, buf, len);
+
+        if (count <= -1) {
+            perror("read");
+        }
+
+        memcpy(addr, buf, count);
+        addr += count;
+        len -= count;
+    }
+    free(buf);
+    return (void*)0;
+}
+#endif
+
 #endif
 
 boolean
@@ -261,5 +333,3 @@ gc_managed_addr_p(lispobj addr)
     }
     return 0;
 }
-
-

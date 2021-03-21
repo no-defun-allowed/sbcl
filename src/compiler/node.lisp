@@ -12,13 +12,129 @@
 
 (in-package "SB-C")
 
-;;; The front-end data structure (IR1) is composed of nodes,
-;;; representing actual evaluations. Linear sequences of nodes in
-;;; control-flow order are combined into blocks (but see
-;;; JOIN-SUCCESSOR-IF-POSSIBLE for precise conditions); control
-;;; transfers inside a block are represented with CTRANs and between
-;;; blocks -- with BLOCK-SUCC/BLOCK-PRED lists; data transfers are
-;;; represented with LVARs.
+(declaim (special *lexenv*))
+
+;;; The LEXENV represents the lexical environment used for IR1 conversion.
+;;; (This is also what shows up as an ENVIRONMENT value in macroexpansion.)
+(declaim (inline internal-make-lexenv))
+(defstruct (lexenv
+            (:include abstract-lexenv)
+             (:print-function
+              (lambda (lexenv stream depth)
+                (if (null-lexenv-p lexenv)
+                    (print-unreadable-object (lexenv stream)
+                      (write-string "NULL-LEXENV" stream))
+                    (default-structure-print lexenv stream depth))))
+             (:copier nil)
+             (:constructor make-null-lexenv ())
+             (:constructor make-almost-null-lexenv (%policy handled-conditions
+                                                    flushable lambda parent))
+             (:constructor make-package-lock-lexenv
+                           (disabled-package-locks %policy
+                            &aux (handled-conditions nil)))
+             (:constructor internal-make-lexenv
+                           (funs vars blocks tags
+                            type-restrictions
+                            flushable
+                            lambda cleanup handled-conditions
+                            disabled-package-locks %policy user-data
+                            parent)))
+  ;; an alist of (NAME . WHAT), where WHAT is either a FUNCTIONAL (a
+  ;; local function), a DEFINED-FUN, representing an
+  ;; INLINE/NOTINLINE declaration, or a list (MACRO . <function>) (a
+  ;; local macro, with the specifier expander). Note that NAME may be
+  ;; a (SETF <name>) list, not necessarily a single symbol.
+  (funs nil :type list)
+  ;; an alist translating variable names to LEAF structures. A special
+  ;; binding is indicated by a :SPECIAL GLOBAL-VAR leaf. Each special
+  ;; binding within the code gets a distinct leaf structure, as does
+  ;; the current "global" value on entry to the code compiled.
+  ;; (locally (special ...)) is handled by adding the most recent
+  ;; special binding to the front of the list.
+  ;;
+  ;; If the CDR is (MACRO . <exp>), then <exp> is the expansion of a
+  ;; symbol macro.
+  (vars nil :type list)
+  ;; BLOCKS and TAGS are alists from block and go-tag names to 2-lists
+  ;; of the form (<entry> <continuation>), where <continuation> is the
+  ;; continuation to exit to, and <entry> is the corresponding ENTRY
+  ;; node.
+  (blocks nil :type list)
+  (tags nil :type list)
+  ;; an alist (THING . CTYPE) which is used to keep track of
+  ;; "pervasive" type declarations. When THING is a leaf, this is for
+  ;; type declarations that pertain to the type in a syntactic extent
+  ;; which does not correspond to a binding of the affected name.
+  (type-restrictions nil :type list)
+  ;; the lexically enclosing lambda, if any
+  (lambda nil :type (or clambda null))
+  ;; the lexically enclosing cleanup, or NIL if none enclosing within LAMBDA
+  (cleanup nil :type (or cleanup null))
+  ;; condition types we handle with a handler around the compiler
+  (handled-conditions *handled-conditions*)
+  ;; lexically disabled package locks (list of symbols)
+  (disabled-package-locks *disabled-package-locks*)
+  ;; the current OPTIMIZE policy. this is null in the null environment,
+  ;; and the global policy is stored in *POLICY*. (Because we want to
+  ;; be able to affect it from :WITH-COMPILATION-UNIT.) NIL here also
+  ;; works as a convenient null-lexenv identifier.
+  (%policy nil :type (or null policy))
+  ;; A list associating extra user info to symbols.  The entries
+  ;; are of the form (:declare name . value),
+  ;; (:variable name key . value), or (:function name key . value)
+  (user-data nil :type list)
+  (parent nil)
+  ;; Cache of all visible variables, including the ones coming from
+  ;; (call-lexenv lambda)
+  ;; Used for LEAF-VISIBLE-TO-DEBUGGER-P
+  (var-cache nil :type (or null hash-table))
+  ;; A list of functions that can be removed when unused.
+  ;; Similar to the FLUSHABLE attribute in DEFKNOWN, but can applied
+  ;; locally to things that are generally not flushable but can be
+  ;; flushed in some circumstances.
+  (flushable nil :type list))
+
+(defun lexenv-policy (lexenv)
+  (or (lexenv-%policy lexenv) *policy*))
+
+(defun null-lexenv-p (lexenv)
+  (not (lexenv-%policy lexenv)))
+
+;;; an object suitable for input to standard functions that accept
+;;; "environment objects" (of the ANSI glossary)
+(def!type lexenv-designator () '(or abstract-lexenv null))
+
+;;; support for the idiom (in MACROEXPAND and elsewhere) that NIL is
+;;; to be taken as a null lexical environment.
+;;; Of course this is a mostly pointless "idiom" because NIL *is*
+;;; an environment, as far as most environment inquiry functions care.
+(defun coerce-to-lexenv (x)
+  (etypecase x
+    (null (make-null-lexenv))
+    (lexenv x)
+    #+(and sb-fasteval (not sb-xc-host))
+    (sb-interpreter:basic-env (sb-interpreter:lexenv-from-env x))))
+
+;;; The front-end data structure (IR1) is composed of nodes and
+;;; continuations. The general idea is that continuations contain
+;;; top-down information and nodes contain bottom-up, derived
+;;; information. A continuation represents a place in the code, while
+;;; a node represents code that does something.
+;;;
+;;; This representation is more of a flow-graph than an augmented
+;;; syntax tree. The evaluation order is explicitly represented in the
+;;; linkage by continuations, rather than being implicit in the nodes
+;;; which receive the the results of evaluation. This allows us to
+;;; decouple the flow of results from the flow of control. A
+;;; continuation represents both, but the continuation can represent
+;;; the case of a discarded result by having no DEST.
+
+;;; Note: Continuations have been split into CTRANs and LVARs. Control
+;;; transfers inside a block are represented with CTRANs; data
+;;; transfers are represented with LVARs. However, many of the
+;;; comments and names have not been updated to reflect this, and it
+;;; is easy to find references to the old way of doing things with
+;;; continuations throughout the compiler.
 
 ;;; "Lead-in" Control TRANsfer [to some node]
 (defstruct (ctran (:constructor make-ctran) (:copier nil))
@@ -572,9 +688,9 @@
   ;; For :DYNAMIC-EXTENT: a list of all DX LVARs, preserved by this
   ;; cleanup. This is filled when the cleanup is created (now by
   ;; locall call analysis) and is rechecked by physical environment
-  ;; analysis. (For closures this is a list of the allocating node -
-  ;; during IR1, and a list of the argument LVAR of the allocator -
-  ;; after physical environment analysis.)
+  ;; analysis. (For closures this is a list of the enclose node during
+  ;; IR1, and a list of the LVAR of the enclose after physical
+  ;; environment analysis.)
   (info nil :type list)
   ;; Used by propagate-ref-dx to check that the new ref is inside the
   ;; original let
@@ -995,9 +1111,9 @@
   (arg-documentation nil :type (or list (member :unspecified)))
   ;; the documentation string for the lambda
   (documentation nil :type (or null string))
-  ;; Node, allocating closure for this lambda. May be NIL when we are
-  ;; sure that no closure is needed.
-  (allocator nil :type (or null combination))
+  ;; the enclose node allocating the closure for this lambda. May be
+  ;; NIL when we are sure that no closure is needed.
+  (enclose nil :type (or null enclose))
   ;; various rare miscellaneous info that drives code generation & stuff
   (plist () :type list)
   ;; xref information for this functional (only used for functions with an
@@ -1613,6 +1729,14 @@
 
 (defstruct (no-op (:include node)
                   (:copier nil)))
+
+;;; The ENCLOSE node marks the place at which closure allocation code
+;;; would be emitted, if necessary.
+(defstruct (enclose (:include valued-node) ; this node uses a dummy lvar for dx analysis
+                    (:copier nil))
+  ;; the list of functionals that this ENCLOSE node allocates.
+  (funs nil :type list))
+
 
 ;;; a helper for the POLICY macro, defined late here so that the
 ;;; various type tests can be inlined

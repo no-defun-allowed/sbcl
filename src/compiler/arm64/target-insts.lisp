@@ -299,7 +299,7 @@
 
 (defun print-cond (value stream dstate)
   (declare (ignore dstate))
-  (princ (svref sb-vm::+condition-name-vec+ value) stream))
+  (princ (svref +condition-name-vec+ value) stream))
 
 (defun use-label (value dstate)
   (let* ((value (if (consp value)
@@ -319,16 +319,14 @@
      (note-code-constant offset dstate))
     (#.sb-vm::null-offset
      (let ((offset (+ sb-vm:nil-value offset)))
-       (maybe-note-assembler-routine offset nil dstate)
        (maybe-note-static-symbol (logior offset other-pointer-lowtag)
                                               dstate)))
     #+sb-thread
     (#.sb-vm::thread-offset
      (let* ((thread-slots
              (load-time-value
-              (primitive-object-slots
-               (find 'sb-vm::thread *primitive-objects*
-                     :key #'primitive-object-name)) t))
+              (primitive-object-slots (primitive-object 'sb-vm::thread))
+              t))
             (slot (find (ash offset (- word-shift)) thread-slots
                         :key #'slot-offset)))
        (when slot
@@ -364,6 +362,12 @@
                             (decode-scaled-immediate value)
                             value)
                         dstate))))
+
+(defun annotate-ldr-literal (value stream dstate)
+  (declare (ignore stream))
+  (let* ((addr (+ (dstate-cur-addr dstate) (* value 4))))
+    (let ((value (sap-ref-word (int-sap addr) 0)))
+      (maybe-note-assembler-routine value nil dstate))))
 
 ;;;; special magic to support decoding internal-error and related traps
 (defun snarf-error-junk (sap offset trap-number &optional length-only)

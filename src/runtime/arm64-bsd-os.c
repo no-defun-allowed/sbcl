@@ -25,7 +25,10 @@
 #include "interrupt.h"
 #include "interr.h"
 #include "lispregs.h"
+
+#ifndef LISP_FEATURE_DARWIN
 #include <machine/sysarch.h>
+#endif
 
 #include <sys/types.h>
 #include <signal.h>
@@ -37,7 +40,9 @@
 #include "validate.h"
 size_t os_vm_page_size;
 
-#if defined(LISP_FEATURE_OPENBSD)
+int arch_os_thread_cleanup(struct thread *thread) {
+    return 1;                   /* success */
+}
 
 int arch_os_thread_init(struct thread *thread) {
     stack_t sigstack;
@@ -53,10 +58,9 @@ int arch_os_thread_init(struct thread *thread) {
 
     return 1;                   /* success */
 }
-int arch_os_thread_cleanup(struct thread *thread) {
-    return 1;                   /* success */
-}
 
+
+#if defined(LISP_FEATURE_OPENBSD)
 
 os_context_register_t   *
 os_context_register_addr(os_context_t *context, int regno)
@@ -100,32 +104,6 @@ os_flush_icache(os_vm_address_t address, os_vm_size_t length)
 }
 
 #elif defined(LISP_FEATURE_NETBSD)
-
-int arch_os_thread_init(struct thread *thread) {
-    stack_t sigstack;
-#ifdef LISP_FEATURE_SB_THREAD
-#ifdef LISP_FEATURE_GCC_TLS
-    current_thread = thread;
-#else
-    pthread_setspecific(specials,thread);
-#endif
-#endif
-    /* Signal handlers are normally run on the main stack, but we've
-     * swapped stacks, require that the control stack contain only
-     * boxed data, and expands upwards while the C stack expands
-     * downwards. */
-    sigstack.ss_sp    = calc_altstack_base(thread);
-    sigstack.ss_flags = 0;
-    sigstack.ss_size  = calc_altstack_size(thread);
-    if(sigaltstack(&sigstack,0)<0)
-        lose("Cannot sigaltstack: %s\n",strerror(errno));
-
-    return 1;                   /* success */
-}
-int arch_os_thread_cleanup(struct thread *thread) {
-    return 1;                   /* success */
-}
-
 os_context_register_t   *
 os_context_register_addr(os_context_t *context, int offset)
 {
@@ -163,4 +141,37 @@ os_flush_icache(os_vm_address_t address, os_vm_size_t length)
     __builtin___clear_cache(address, address + length);
 }
 
+#elif defined (LISP_FEATURE_DARWIN)
+os_context_register_t   *
+os_context_register_addr(os_context_t *context, int regno)
+{
+    switch (regno) {
+        case reg_LR:    return (os_context_register_t*)(&context->uc_mcontext->__ss.__lr);
+        case reg_NSP:   return (os_context_register_t*)(&context->uc_mcontext->__ss.__sp);
+        default:        return (os_context_register_t*)(&context->uc_mcontext->__ss.__x[regno]);
+    }
+}
+
+os_context_register_t *
+os_context_pc_addr(os_context_t *context)
+{
+    return (os_context_register_t*)(&context->uc_mcontext->__ss.__pc);
+}
+
+os_context_register_t   *
+os_context_float_register_addr(os_context_t *context, int offset)
+{
+    return NULL;
+}
+
+void
+os_restore_fp_control(os_context_t *context)
+{
+}
+
+os_context_register_t *
+os_context_lr_addr(os_context_t *context)
+{
+    return os_context_register_addr(context, reg_LR);
+}
 #endif
