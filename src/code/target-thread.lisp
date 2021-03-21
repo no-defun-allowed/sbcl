@@ -2538,16 +2538,3 @@ mechanism for inter-thread communication."
                      #-sb-thread (sap-ref-lispobj from sb-vm:n-word-bytes)))
             (show sym val))
           (setq from (sap+ from (* sb-vm:binding-size sb-vm:n-word-bytes))))))))
-
-#+sb-record-mutex-misses
-(defun find-counter (name)
-  (declare (ignore name))
-  nil
-  #+(or)
-  (with-mutex (*counter-lock*)
-    (multiple-value-bind (counter present?)
-        (gethash name *counters*)
-      (if present?
-          counter
-          (setf (gethash name *counters*)
-                (make-array 1 :element-type 'sb-ext:word :initial-element 0))))))

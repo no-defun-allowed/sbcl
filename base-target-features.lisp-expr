@@ -200,7 +200,6 @@
  ;; x86oid Linux. Other platforms that support them include
  ;; x86oid Darwin, FreeBSD, and Solaris.
  ; :sb-thread
- :sb-record-mutex-misses
 
  ;; futex support
  ;;
